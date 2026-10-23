@@ -95,25 +95,65 @@ jobs:
           set -euo pipefail
 
           # ── ۱. اعتبارسنجی secretها ──────────────────────────
-          check_secret() {
+          # ── نرمال‌سازی + اعتبارسنجی ──
+          # هدف فقط جلوگیری از انتشار placeholder است، نه سخت‌گیری روی
+          # فرمت: newline، اسلش انتهایی و نبودِ scheme همه اصلاح می‌شوند.
+          #
+          # توجه: این تابع را داخل $(...) صدا نمی‌زنیم؛ چون در آن حالت
+          # خروجی echoها گرفته می‌شود و `exit 1` فقط subshell را می‌بندد.
+          # به‌جایش نتیجه در NORMALIZED_URL قرار می‌گیرد.
+          NORMALIZED_URL=""
+          normalize_url() {
             local name="$1" value="$2"
+
+            # ۱. حذف newline/CR و فاصله‌های ابتدا و انتها
+            value="$(printf '%s' "$value" | tr -d '\r\n')"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
             if [ -z "$value" ]; then
               echo "::error title=Missing secret::$name is empty or not set. Add it in Settings → Secrets and variables → Actions."
               exit 1
             fi
+
+            # ۲. placeholder باید سخت fail کند
             if [[ "$value" == *"__"* ]]; then
               echo "::error title=Placeholder secret::$name still contains a __PLACEHOLDER__ ($value)"
               exit 1
             fi
-            # باید https با host معتبر باشد؛ «https://?» رد می‌شود
-            if [[ ! "$value" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
-              echo "::error title=Invalid secret::$name is not a valid https URL (got: $value)"
+            if [[ "$value" == "?" || "$value" == "https://?" || "$value" == "http://?" ]]; then
+              echo "::error title=Placeholder secret::$name is the literal \"?\" placeholder"
               exit 1
             fi
+
+            # ۳. اگر scheme ندارد https:// اضافه کن؛ http را ارتقا بده
+            case "$value" in
+              http://*)
+                echo "::warning title=Insecure secret::$name uses http:// — upgrading to https://"
+                value="https://${value#http://}" ;;
+              https://*)
+                : ;;
+              *)
+                value="https://$value" ;;
+            esac
+
+            # ۴. حذف اسلش‌های انتهایی (جلوگیری از //session-init)
+            while [ "${value%/}" != "$value" ]; do value="${value%/}"; done
+
+            # ۵. sanity check نهایی — باید host داشته باشد
+            if [[ ! "$value" =~ ^https://[A-Za-z0-9._-]+ ]]; then
+              echo "::error title=Invalid secret::$name has no valid host (got: $value)"
+              exit 1
+            fi
+
+            NORMALIZED_URL="$value"
           }
 
-          check_secret "CF_STREAMING_URL" "${CF_STREAMING_URL:-}"
-          check_secret "CF_SIGNALING_URL" "${CF_SIGNALING_URL:-}"
+          normalize_url "CF_STREAMING_URL" "${CF_STREAMING_URL:-}"
+          CF_STREAMING_URL="$NORMALIZED_URL"
+
+          normalize_url "CF_SIGNALING_URL" "${CF_SIGNALING_URL:-}"
+          CF_SIGNALING_URL="$NORMALIZED_URL"
 
           # ── ۲. escape برای sed ──────────────────────────────
           # در replacement سمت sed، سه کاراکتر خاص‌اند: \ ، & و delimiter (|)
