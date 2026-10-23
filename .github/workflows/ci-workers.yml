@@ -19,7 +19,10 @@ on:
       - ".github/workflows/ci-workers.yml"
 
 concurrency:
-  group: "ci-workers-${{ github.event.pull_request.number || github.ref }}-${{ matrix.worker }}"
+  # توجه: context‌های matrix و steps در concurrency در دسترس نیستند —
+  # فقط github / inputs / vars مجاز است. استفاده از matrix.worker اینجا
+  # کل فایل را نامعتبر می‌کند (GitHub آن را با نام فایل و failure ثبت می‌کند).
+  group: "ci-workers-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: true
 
 permissions:
