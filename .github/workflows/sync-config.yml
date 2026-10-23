@@ -231,6 +231,54 @@ jobs:
           python3 -c "import json, sys; json.loads(sys.argv[1])" "$KV_CONTENT"
           echo "✅ KV content is valid JSON"
 
+          # ── اعتبارسنجی endpoint ها در برابر wrangler.toml ──────────
+          # مقایسهٔ version هیچ چیزی دربارهٔ درستی آدرس‌ها نمی‌گوید: کانفیگِ
+          # خراب هم همان version را داشت و smoke test سبز بود. پس نامِ هر
+          # worker را از wrangler.toml خودش می‌خوانیم (بدون hardcode) و
+          # چک می‌کنیم که میزبانِ endpoint با آن بخواند.
+          KV_CONTENT="$KV_CONTENT" python3 - <<'PYEOF'
+          import json, os, re, sys
+          cfg = json.loads(os.environ["KV_CONTENT"])
+          endpoints = cfg.get("endpoints") or {}
+          def worker_name(path):
+              with open(path, encoding="utf-8") as fh:
+                  for line in fh:
+                      m = re.match(r'\s*name\s*=\s*"([^"]+)"', line)
+                      if m:
+                          return m.group(1)
+              return None
+          expected = {
+              "cloudflare_stream_worker": "streaming-worker/wrangler.toml",
+              "cloudflare_signaling_worker": "signaling-worker/wrangler.toml",
+          }
+          errors = []
+          for key, toml_path in expected.items():
+              url = endpoints.get(key)
+              if not url:
+                  errors.append(f"{key}: missing from KV config")
+                  continue
+              if not re.match(r"^https://[^/]+$", url):
+                  errors.append(f"{key}: not a bare https URL: {url}")
+                  continue
+              name = worker_name(toml_path)
+              if not name:
+                  sys.exit(f"cannot read worker name from {toml_path}")
+              host = url.split("://", 1)[1]
+              if not host.startswith(name + "."):
+                  errors.append(
+                      f"{key}: host '{host}' does not belong to worker '{name}' "
+                      f"(from {toml_path}) - expected '{name}.<account>.workers.dev'"
+                  )
+              else:
+                  print(f"✅ {key} -> {url} (matches workers/{name})")
+          if errors:
+              print("❌ SMOKE TEST FAILED: endpoint/worker mismatch")
+              for e in errors:
+                  print(f"   - {e}")
+              sys.exit(1)
+          print("✅ Endpoints match their wrangler.toml worker names")
+          PYEOF
+
   # ════════════════════════════════════════════════════════════
   #  JOB 3: Notify Workers
   # ════════════════════════════════════════════════════════════
