@@ -1,0 +1,371 @@
+# ══════════════════════════════════════════════════════════════
+#  SCP-GHOST GitOps Pipeline — Argo CD Style
+#  
+#  فلسفه: GitHub = منبع حقیقت (Source of Truth)
+#  هر commit به config/ → validate → sync به Cloudflare KV
+#  هیچ‌کس دستی wrangler kv put نمی‌زند.
+# ══════════════════════════════════════════════════════════════
+name: "🔄 GitOps — Sync Config to Cloudflare KV"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # فقط وقتی config تغییر کرده trigger می‌شود
+      - "config/ghost-routing-config.json"
+      - "config/config.schema.json"
+
+  # Sync دستی از GitHub UI — مثل دکمه "Sync" در Argo CD
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "Force sync even without config changes"
+        required: false
+        default: "false"
+        type: boolean
+      dry_run:
+        description: "Validate only, do not write to KV"
+        required: false
+        default: "false"
+        type: boolean
+
+  # Drift Detection — هر ۶ ساعت یک بار KV را re-sync می‌کند
+  # مثل Argo CD reconciliation loop
+  schedule:
+    - cron: "0 */6 * * *"
+
+# فقط یک sync در هر زمان — جلوگیری از race condition
+concurrency:
+  group: "ghost-config-sync"
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+  CONFIG_FILE: "config/ghost-routing-config.json"
+  SCHEMA_FILE: "config/config.schema.json"
+  KV_CONFIG_KEY: "routing_config"
+  KV_METADATA_KEY: "sync_metadata"
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  #  JOB 1: Validate Config
+  #  معادل: Argo CD pre-sync hooks / kubeval
+  # ════════════════════════════════════════════════════════════
+  validate:
+    name: "🔍 Validate JSON Schema"
+    runs-on: ubuntu-latest
+    outputs:
+      config_version: ${{ steps.extract_version.outputs.version }}
+      config_hash: ${{ steps.hash.outputs.hash }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── نصب Node.js و ajv-cli ─────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install ajv-cli with formats support
+        run: |
+          npm install -g ajv-cli@5 ajv-formats@3
+          echo "✅ ajv-cli installed: $(ajv --version)"
+
+      # ── Schema Validation ─────────────────────────────────
+      - name: Validate config against JSON Schema
+        run: |
+          ajv validate \
+            --spec=draft2020 \
+            -s "${{ env.SCHEMA_FILE }}" \
+            -d "${{ env.CONFIG_FILE }}" \
+            -c ajv-formats \
+            --all-errors \
+            --verbose
+          echo "✅ Schema validation passed"
+
+      # ── Business Logic Validation با Python ───────────────
+      - name: Validate routing rules business logic
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          with open("${{ env.CONFIG_FILE }}") as f:
+              config = json.load(f)
+
+          rules = config.get("routing_rules", [])
+          errors = []
+
+          # ۱. بررسی وجود default_deny
+          deny_rules = [r for r in rules if r["action"]["backend"] == "deny"]
+          if not deny_rules:
+              errors.append("FATAL: No 'deny' backend rule found. default_deny is required.")
+
+          # ۲. بررسی یکتایی priority ها
+          priorities = [r["priority"] for r in rules]
+          if len(priorities) != len(set(priorities)):
+              errors.append(f"ERROR: Duplicate priorities found: {priorities}")
+
+          # ۳. بررسی priority=99 برای deny rule
+          for deny_rule in deny_rules:
+              if deny_rule["priority"] != 99:
+                  errors.append(
+                      f"WARNING: deny rule '{deny_rule['name']}' should have priority=99, "
+                      f"got {deny_rule['priority']}"
+                  )
+
+          # ۴. بررسی Apps Script Pool حداقل یک endpoint داشته باشد
+          for rule in rules:
+              if rule["action"]["backend"] == "google_apps_script_pool":
+                  eps = rule["action"].get("endpoints", [])
+                  if not eps:
+                      errors.append(
+                          f"ERROR: Rule '{rule['name']}' has google_apps_script_pool "
+                          f"backend but no endpoints defined."
+                      )
+                  if len(eps) > 10:
+                      errors.append(
+                          f"WARNING: Rule '{rule['name']}' has {len(eps)} endpoints. "
+                          f"Max recommended is 4 (quota management)."
+                      )
+
+          # ۵. بررسی rate_limits معقول
+          rate = config.get("rate_limits", {})
+          if rate.get("streaming_rpm", 0) > 1000:
+              errors.append(
+                  f"WARNING: streaming_rpm={rate['streaming_rpm']} is very high. "
+                  f"Cloudflare free tier: 100K req/day (~69/min)."
+              )
+
+          if errors:
+              for e in errors:
+                  print(f"{'❌' if 'FATAL' in e or 'ERROR' in e else '⚠️'} {e}")
+              fatal = [e for e in errors if "FATAL" in e or "ERROR" in e]
+              if fatal:
+                  sys.exit(1)
+          
+          print(f"✅ Business logic validation passed")
+          print(f"   Rules: {len(rules)}")
+          print(f"   Version: {config['version']}")
+          print(f"   Deny rules: {len(deny_rules)}")
+          EOF
+
+      # ── استخراج version برای downstream jobs ──────────────
+      - name: Extract config version
+        id: extract_version
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('${{ env.CONFIG_FILE }}'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📌 Config version: $VERSION"
+
+      # ── محاسبه hash برای تشخیص drift ─────────────────────
+      - name: Calculate config file hash
+        id: hash
+        run: |
+          HASH=$(sha256sum "${{ env.CONFIG_FILE }}" | awk '{print $1}')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "🔑 Config SHA-256: $HASH"
+
+  # ════════════════════════════════════════════════════════════
+  #  JOB 2: Sync to Cloudflare KV
+  #  معادل: Argo CD sync phase / kubectl apply
+  # ════════════════════════════════════════════════════════════
+  sync:
+    name: "🚀 Sync → Cloudflare KV"
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production   # نیاز به approval در GitHub Environments دارد
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Wrangler v4
+        run: |
+          npm install -g wrangler@4
+          echo "✅ Wrangler installed: $(wrangler --version)"
+
+      # ── Dry Run Mode ──────────────────────────────────────
+      - name: "[DRY RUN] Show what would be synced"
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "🧪 DRY RUN MODE — No changes will be made to KV"
+          echo ""
+          echo "Would sync:"
+          echo "  Key: ${{ env.KV_CONFIG_KEY }}"
+          echo "  Version: ${{ needs.validate.outputs.config_version }}"
+          echo "  Hash: ${{ needs.validate.outputs.config_hash }}"
+          echo ""
+          cat "${{ env.CONFIG_FILE }}" | python3 -m json.tool
+          exit 0
+
+      # ── نوشتن Config در KV ────────────────────────────────
+      # معادل: kubectl apply -f config/ در Argo CD
+      - name: Upload routing config to Cloudflare KV
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "📤 Uploading routing_config to KV..."
+          
+          wrangler kv key put \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_CONFIG_KEY }}" \
+            "$(cat ${{ env.CONFIG_FILE }})" \
+            --remote
+
+          echo "✅ routing_config uploaded successfully"
+
+      # ── نوشتن Sync Metadata در KV ─────────────────────────
+      # معادل: Argo CD sync status در ArgoCD UI
+      - name: Write sync metadata to KV
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_SHORT="${COMMIT_SHA:0:7}"
+          COMMIT_MSG=$(echo '${{ github.event.head_commit.message }}' | head -1 | cut -c1-100)
+          ACTOR="${{ github.actor }}"
+          RUN_ID="${{ github.run_id }}"
+          VERSION="${{ needs.validate.outputs.config_version }}"
+          CONFIG_HASH="${{ needs.validate.outputs.config_hash }}"
+          TRIGGER="${{ github.event_name }}"
+
+          METADATA=$(python3 -c "
+          import json
+          print(json.dumps({
+              'commit_sha': '$COMMIT_SHORT',
+              'commit_sha_full': '$COMMIT_SHA',
+              'commit_message': '$COMMIT_MSG',
+              'config_version': '$VERSION',
+              'config_hash': '$CONFIG_HASH',
+              'synced_at': '$TIMESTAMP',
+              'synced_by': '$ACTOR',
+              'run_id': '$RUN_ID',
+              'trigger': '$TRIGGER',
+              'status': 'synced'
+          }))
+          ")
+
+          wrangler kv key put \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_METADATA_KEY }}" \
+            "$METADATA" \
+            --remote
+
+          echo "✅ Sync metadata written:"
+          echo "$METADATA" | python3 -m json.tool
+
+      # ── Smoke Test: تأیید sync موفق ───────────────────────
+      # معادل: Argo CD health check بعد از sync
+      - name: Smoke test — Verify config is live in KV
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "🔬 Running smoke test..."
+          sleep 3   # صبر کوتاه برای propagation
+
+          # خواندن config از KV
+          KV_CONTENT=$(wrangler kv key get \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_CONFIG_KEY }}" \
+            --remote 2>/dev/null)
+
+          if [ -z "$KV_CONTENT" ]; then
+            echo "❌ SMOKE TEST FAILED: KV returned empty content"
+            exit 1
+          fi
+
+          # تأیید version match
+          KV_VERSION=$(echo "$KV_CONTENT" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")
+          EXPECTED="${{ needs.validate.outputs.config_version }}"
+
+          if [ "$KV_VERSION" == "$EXPECTED" ]; then
+            echo "✅ SMOKE TEST PASSED"
+            echo "   KV Version: $KV_VERSION"
+            echo "   Expected:   $EXPECTED"
+          else
+            echo "❌ SMOKE TEST FAILED: Version mismatch"
+            echo "   KV Version: $KV_VERSION"
+            echo "   Expected:   $EXPECTED"
+            exit 1
+          fi
+
+          # تأیید اینکه JSON valid است
+          echo "$KV_CONTENT" | python3 -m json.tool > /dev/null
+          echo "✅ KV content is valid JSON"
+
+  # ════════════════════════════════════════════════════════════
+  #  JOB 3: Notify Workers
+  #  معادل: Argo CD post-sync hooks
+  # ════════════════════════════════════════════════════════════
+  notify:
+    name: "📡 Notify Workers — Config Refreshed"
+    runs-on: ubuntu-latest
+    needs: [validate, sync]
+    if: ${{ github.event.inputs.dry_run != 'true' }}
+
+    steps:
+      - name: Trigger config reload hint via Signaling Worker
+        env:
+          CF_SIGNALING_URL: ${{ secrets.CF_SIGNALING_URL }}
+          GHOST_RELOAD_TOKEN: ${{ secrets.GHOST_RELOAD_TOKEN }}
+        run: |
+          echo "📡 Sending reload hint to Signaling Worker..."
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$CF_SIGNALING_URL/admin/reload-config" \
+            -H "Authorization: Bearer $GHOST_RELOAD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"source\": \"gitops\",
+              \"commit\": \"${{ github.sha }}\",
+              \"version\": \"${{ needs.validate.outputs.config_version }}\",
+              \"timestamp\": \"$(date -u +%s)\"
+            }" \
+            --max-time 10 \
+            --connect-timeout 5)
+
+          if [ "$HTTP_STATUS" == "200" ]; then
+            echo "✅ Workers notified successfully (HTTP $HTTP_STATUS)"
+          else
+            # non-fatal — Workers به صورت lazy از KV می‌خوانند
+            echo "⚠️ Reload hint returned HTTP $HTTP_STATUS (non-fatal)"
+            echo "   Workers will pick up new config on next request from KV"
+          fi
+
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: `Config v${{ needs.validate.outputs.config_version }} synced to KV`,
+              auto_merge: false,
+              required_contexts: []
+            });
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.id,
+              state: 'success',
+              description: `Ghost routing config v${{ needs.validate.outputs.config_version }} deployed`,
+              environment_url: '${{ secrets.CF_SIGNALING_URL }}/health'
+            });
+
+            core.info(`✅ GitHub deployment status created: ${deployment.id}`);

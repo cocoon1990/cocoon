@@ -1,0 +1,31 @@
+name             = "ghost-streaming-worker"
+main             = "build/worker/shim.mjs"
+compatibility_date = "2025-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "worker-build --release"
+
+# ── Durable Objects ────────────────────────────────────────────
+[[durable_objects.bindings]]
+name       = "RATE_LIMITER"
+class_name = "SlidingWindowRateLimiter"
+
+# مهم: new_sqlite_classes برای فعال‌سازی SQLite API
+[[migrations]]
+tag               = "v1"
+new_sqlite_classes = ["SlidingWindowRateLimiter"]
+
+# ── KV Namespace (Config) ─────────────────────────────────────
+[[kv_namespaces]]
+binding = "GHOST_CONFIG"
+id      = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# ── Secrets (inject شده توسط wrangler یا GitHub Actions) ─────
+# HMAC_SECRET — با `wrangler secret put HMAC_SECRET` تنظیم می‌شود
+
+[vars]
+WORKER_VERSION   = "5.0.0"
+CONFIG_KV_KEY    = "routing_config"
+RATE_LIMIT_RPM   = "500"
+RATE_WINDOW_MS   = "60000"

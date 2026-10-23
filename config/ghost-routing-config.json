@@ -1,0 +1,116 @@
+{
+  "$schema": "./config.schema.json",
+  "version": "5.0.0",
+  "updated_at": "2025-10-23T00:00:00Z",
+  "routing_rules": [
+    {
+      "name": "video_streaming_rule",
+      "priority": 1,
+      "comment": "معادل: location ~* \\.(m4s|mp4)$ { proxy_pass ... } در Nginx",
+      "match": {
+        "url_patterns": [
+          "*.googlevideo.com/*",
+          "*/videoplayback*",
+          "*/.m4s",
+          "*/.mp4",
+          "*/video/*"
+        ],
+        "min_size_bytes": 102400,
+        "content_types": [
+          "video/mp4",
+          "video/webm",
+          "application/octet-stream"
+        ]
+      },
+      "action": {
+        "backend": "cloudflare_stream_worker",
+        "endpoint": "/stream",
+        "pipe_mode": "ReadableStream",
+        "hmac_required": true,
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "name": "api_buffered_rule",
+      "priority": 2,
+      "comment": "معادل: location ~* \\.(json|js|css|html)$ { proxy_pass ... } در Nginx",
+      "match": {
+        "url_patterns": [
+          "*/api/*",
+          "*.json",
+          "*.js",
+          "*.css",
+          "*.html",
+          "*.woff2",
+          "*.svg"
+        ],
+        "max_size_bytes": 52428800
+      },
+      "action": {
+        "backend": "google_apps_script_pool",
+        "strategy": "round_robin",
+        "endpoints": [
+          "GAS_ENDPOINT_1",
+          "GAS_ENDPOINT_2",
+          "GAS_ENDPOINT_3",
+          "GAS_ENDPOINT_4"
+        ],
+        "hmac_required": true,
+        "timeout_ms": 10000,
+        "failover": "next_healthy_endpoint"
+      }
+    },
+    {
+      "name": "signaling_websocket_rule",
+      "priority": 3,
+      "comment": "معادل: location /ws { proxy_pass ... upgrade=websocket } در Nginx",
+      "match": {
+        "url_patterns": [
+          "*/ws",
+          "*/ws/*",
+          "*/config",
+          "*/health"
+        ]
+      },
+      "action": {
+        "backend": "cloudflare_signaling_worker",
+        "endpoint": "/ws",
+        "pipe_mode": "WebSocket",
+        "hmac_required": false,
+        "timeout_ms": 0
+      }
+    },
+    {
+      "name": "default_deny",
+      "priority": 99,
+      "comment": "معادل: deny all در Nginx — هیچ درخواست ناشناخته‌ای پذیرفته نمی‌شود",
+      "match": {
+        "url_patterns": ["*"]
+      },
+      "action": {
+        "backend": "deny",
+        "endpoint": null,
+        "pipe_mode": null,
+        "hmac_required": false,
+        "timeout_ms": 0,
+        "status_code": 403,
+        "message": "No routing rule matched. Request denied."
+      }
+    }
+  ],
+  "rate_limits": {
+    "streaming_rpm": 500,
+    "buffered_rpm": 2000,
+    "window_seconds": 60
+  },
+  "health_check": {
+    "interval_seconds": 30,
+    "failure_threshold": 3,
+    "success_threshold": 1,
+    "probe_timeout_ms": 5000
+  },
+  "endpoints": {
+    "cloudflare_stream_worker": "https://ghost-streaming.YOUR_SUBDOMAIN.workers.dev",
+    "cloudflare_signaling_worker": "https://ghost-signaling.YOUR_SUBDOMAIN.workers.dev"
+  }
+}
