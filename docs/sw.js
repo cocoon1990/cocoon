@@ -112,6 +112,11 @@ self.addEventListener("message", (event) => {
               console.error("[Ghost SW] PING init failed:", err)
             );
           }
+          // اگر Wasm قبلاً لود شده است، WASM_READY را دوباره broadcast کنیم
+          // برای کلاینت‌هایی که ممکن است پیام اولیه را از دست داده باشند
+          if (wasmReady) {
+            notifyClients({ type: "WASM_READY", version: SW_VERSION });
+          }
           event.ports[0]?.postMessage(getStatus());
         })()
       );
@@ -132,7 +137,7 @@ self.addEventListener("message", (event) => {
 // ──────────────────────────────────────────────────────────────
 async function initializeGhostSystem({ force } = {}) {
   try {
-    // idempotent: اگر前に conclu شده، اجرا دوباره نکن
+    // ایدپوتنت: اگر قبلاً انجام شده، اجرا دوباره نکن
     if (!force && wasmModule && routerReady) {
       return;
     }
@@ -141,14 +146,19 @@ async function initializeGhostSystem({ force } = {}) {
 
     // ── Step 1: Import و Init Wasm Module ──────────────────
     if (!wasmModule) {
-      const { default: init, ...exports } = await import(WASM_MODULE_PATH);
-      await init(); // Wasm binary را لود می‌کند
-      wasmModule = exports;
-      wasmReady = true;
-      console.log("[Ghost SW] ✅ Wasm module loaded");
+      try {
+        const { default: init, ...exports } = await import(WASM_MODULE_PATH);
+        await init(); // Wasm binary را لود می‌کند
+        wasmModule = exports;
+        wasmReady = true;
+        console.log("[Ghost SW] ✅ Wasm module loaded");
 
-      // broadcast WASM_READY به کل client هاست (UI Connect دکمه را فعال می‌کند)
-      notifyClients({ type: "WASM_READY", version: SW_VERSION });
+        // broadcast WASM_READY به کل client هاست (UI Connect دکمه را فعال می‌کند)
+        notifyClients({ type: "WASM_READY", version: SW_VERSION });
+      } catch (importErr) {
+        console.error("[Ghost SW] ❌ Wasm import failed:", importErr);
+        throw importErr; // بلوک catch پایین broadcast WASM_FAILED می‌فرستد
+      }
     }
 
     // ── Step 2: دریافت Config از Signaling Worker ──────────
@@ -174,6 +184,8 @@ async function initializeGhostSystem({ force } = {}) {
     console.error("[Ghost SW] ❌ Initialization failed:", err);
     routerReady = false;
     wasmReady = false;
+    // اطلاع به کلاینت‌ها که Wasm لود نشد — UI می‌تواند خطای مربوطه را نمایش دهد
+    notifyClients({ type: "WASM_FAILED", version: SW_VERSION }).catch(() => {});
   }
 }
 

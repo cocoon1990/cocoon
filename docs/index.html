@@ -520,6 +520,16 @@ async function registerServiceWorker() {
     }
     updateConnectButton();
 
+    // Fail-safe: اگر ۵ ثانیه بعد از ثبت SW، wasmReady فعال نشده باشد،
+    // خطای صريح در لاگ نمایش داده می‌شود.
+    setTimeout(() => {
+      if (!wasmReady) {
+        log("❌ Wasm ماژول در Service Worker لود نشد. لطفاً صفحه را رفرش کنید.", "error");
+        setDot("wasm", "error", "Wasm خطا");
+        setBanner("❌", "Wasm لود نشد", "error");
+      }
+    }, 5000);
+
   } catch (err) {
     log(`خطا در ثبت Service Worker: ${err.message}`, "error");
     setDot("sw", "error", "خطا");
@@ -893,6 +903,13 @@ navigator.serviceWorker.addEventListener("message", (event) => {
   if (type === "GHOST_READY") {
     log(`Service Worker آماده — v${version}`, "ok");
     setDot("wasm", "ok", "Router load شد");
+    updateConnectButton();
+  }
+
+  if (type === "WASM_FAILED") {
+    log("❌ Wasm ماژول در Service Worker لود نشد. لطفاً صفحه را رفرش کنید.", "error");
+    setDot("wasm", "error", "Wasm خطا");
+    setBanner("❌", "Wasm لود نشد", "error");
     updateConnectButton();
   }
 });
