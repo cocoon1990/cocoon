@@ -7,14 +7,21 @@
 name: "🌐 Build & Deploy — GitHub Pages"
 
 on:
+  # ── اجرای دستی ────────────────────────────────────────────────
+  # اولین trigger در بلوک on — همیشه در دسترس است،
+  # حتی وقتی paths filter با هیچ تغییری match نشود.
+  workflow_dispatch:
+
+  # ── اجرای خودکار روی main ─────────────────────────────────────
   push:
     branches:
       - main
     paths:
       - "browser-wasm/**"
       - "docs/**"
-
-  workflow_dispatch: {}
+      # تغییر در خودِ این ورکفلو هم باید اجرا را trigger کند،
+      # وگرنه اصلاحات CI هرگز خودشان تست نمی‌شوند.
+      - ".github/workflows/deploy-pages.yml"
 
 concurrency:
   group: "ghost-pages-deploy"
