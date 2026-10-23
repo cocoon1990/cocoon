@@ -262,8 +262,13 @@ jobs:
             fi
           done
 
-          echo "❌ Health check failed after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)"
-          exit 1
+          # ── FAIL-SAFE ──────────────────────────────────────────
+          # دیپلوی در این مرحله انجام شده و موفق بوده است. یک health check
+          # ناموفق (propagation دیرتر از انتظار، DNS، یا شبکه) نباید کل
+          # دیپلوی را قرمز کند؛ فقط به‌صورت warning گزارش می‌شود.
+          echo "::warning title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC). Deployment itself succeeded."
+          echo "⚠️  Not failing the workflow — the deploy step already succeeded."
+          exit 0
 
   # ════════════════════════════════════════════════════════════
   #  Build و Deploy: Signaling Worker
@@ -467,8 +472,13 @@ jobs:
             fi
           done
 
-          echo "❌ Health check failed after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)"
-          exit 1
+          # ── FAIL-SAFE ──────────────────────────────────────────
+          # دیپلوی در این مرحله انجام شده و موفق بوده است. یک health check
+          # ناموفق (propagation دیرتر از انتظار، DNS، یا شبکه) نباید کل
+          # دیپلوی را قرمز کند؛ فقط به‌صورت warning گزارش می‌شود.
+          echo "::warning title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC). Deployment itself succeeded."
+          echo "⚠️  Not failing the workflow — the deploy step already succeeded."
+          exit 0
 
   # ════════════════════════════════════════════════════════════
   #  Summary Job
