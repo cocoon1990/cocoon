@@ -79,19 +79,73 @@ jobs:
 
       # ── Inject runtime config به sw.js ────────────────────
       # URL های Worker در زمان build به Service Worker تزریق می‌شوند
-      - name: Inject Cloudflare endpoint URLs into sw.js
+      # ══════════════════════════════════════════════════════════
+      #  تزریق URLهای واقعی Worker در **هر دو** فایل:
+      #    • docs/sw.js       → STREAMING_WORKER_URL و SIGNALING_WORKER_URL
+      #    • docs/index.html  → SIGNALING_URL  (قبلاً از قلم افتاده بود
+      #      و UI با placeholder «__CF_SIGNALING_URL__» به شبکه می‌رفت)
+      #  اگر secret خالی/placeholder باشد، ورک‌فلو **fail** می‌شود تا
+      #  هرگز سایتی با placeholder منتشر نشود.
+      # ══════════════════════════════════════════════════════════
+      - name: Inject Cloudflare endpoint URLs into docs
         env:
           CF_STREAMING_URL: ${{ secrets.CF_STREAMING_URL }}
           CF_SIGNALING_URL: ${{ secrets.CF_SIGNALING_URL }}
         run: |
-          # جایگزینی placeholder ها با URL های واقعی
-          sed -i \
-            -e "s|__CF_STREAMING_URL__|${CF_STREAMING_URL}|g" \
-            -e "s|__CF_SIGNALING_URL__|${CF_SIGNALING_URL}|g" \
-            docs/sw.js
+          set -euo pipefail
 
-          echo "✅ Injected endpoints into sw.js:"
-          grep -n "STREAMING_WORKER_URL\|SIGNALING_WORKER_URL" docs/sw.js | head -5
+          # ── ۱. اعتبارسنجی secretها ──────────────────────────
+          check_secret() {
+            local name="$1" value="$2"
+            if [ -z "$value" ]; then
+              echo "::error title=Missing secret::$name is empty or not set. Add it in Settings → Secrets and variables → Actions."
+              exit 1
+            fi
+            if [[ "$value" == *"__"* ]]; then
+              echo "::error title=Placeholder secret::$name still contains a __PLACEHOLDER__ ($value)"
+              exit 1
+            fi
+            # باید https با host معتبر باشد؛ «https://?» رد می‌شود
+            if [[ ! "$value" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+              echo "::error title=Invalid secret::$name is not a valid https URL (got: $value)"
+              exit 1
+            fi
+          }
+
+          check_secret "CF_STREAMING_URL" "${CF_STREAMING_URL:-}"
+          check_secret "CF_SIGNALING_URL" "${CF_SIGNALING_URL:-}"
+
+          # ── ۲. escape برای sed ──────────────────────────────
+          # در replacement سمت sed، سه کاراکتر خاص‌اند: \ ، & و delimiter (|)
+          sed_escape() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
+          STREAMING_ESC="$(sed_escape "$CF_STREAMING_URL")"
+          SIGNALING_ESC="$(sed_escape "$CF_SIGNALING_URL")"
+
+          # ── ۳. تزریق در هر دو فایل ──────────────────────────
+          # (index.html فقط SIGNALING_URL دارد؛ sw.js هر دو را)
+          for f in docs/index.html docs/sw.js; do
+            if [ ! -f "$f" ]; then
+              echo "::error title=Missing file::$f not found"
+              exit 1
+            fi
+            sed -i \
+              -e "s|__CF_STREAMING_URL__|${STREAMING_ESC}|g" \
+              -e "s|__CF_SIGNALING_URL__|${SIGNALING_ESC}|g" \
+              "$f"
+            echo "✅ injected: $f"
+          done
+
+          # ── ۴. تأیید: هیچ placeholderی نباید باقی بماند ──────
+          echo ""
+          echo "🔎 Injected values:"
+          grep -n "SIGNALING_URL" docs/index.html | head -3
+          grep -n "STREAMING_WORKER_URL\|SIGNALING_WORKER_URL" docs/sw.js | head -3
+
+          if grep -n '__CF_[A-Z_]*__' docs/index.html docs/sw.js; then
+            echo "::error title=Placeholder left::__CF_* placeholders survived substitution"
+            exit 1
+          fi
+          echo "✅ no __CF_* placeholders left in docs/"
 
       # ── حذف فایل‌های اضافی wasm-pack ─────────────────────
       - name: Clean up unnecessary wasm-pack artifacts
