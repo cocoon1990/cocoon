@@ -12,3 +12,9 @@ id = "e9277d0612d04fae97e8d0d7ac6dc87d"
 
 [vars]
 WORKER_VERSION = "5.0.0"
+# ── CORS allowlist ─────────────────────────────────────────────
+# فقط این origin(ها) می‌توانند پاسخ‌های cross-origin را بخوانند.
+# چند مقدار با کاما جدا می‌شود (مثلاً دامنهٔ سفارشی + github.io).
+# این var در signaling-worker/src/lib.rs خوانده می‌شود؛ اگر حذف شود،
+# کد به مقدار پیش‌فرض امن خودش (همین آدرس) برمی‌گردد.
+ALLOWED_ORIGIN = "https://cocoon1990.github.io"
