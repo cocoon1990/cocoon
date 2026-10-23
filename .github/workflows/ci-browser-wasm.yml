@@ -74,16 +74,26 @@ jobs:
           echo "✅ dependency graph resolved"
           cargo tree -p ghost-browser-wasm --depth 1 2>/dev/null | head -20 || true
 
+      # ── cargo check: سریع‌ترین راه برای گرفتن خطاهای کامپایل ──
+      - name: cargo check (fast compile gate)
+        id: check
+        working-directory: browser-wasm
+        run: |
+          set -o pipefail
+          cargo check --release --target wasm32-unknown-unknown 2>&1 \
+            | tee "$RUNNER_TEMP/check.log"
+
       # ── Build ──────────────────────────────────────────────
       - name: Build browser-wasm (Rust → Wasm)
         working-directory: browser-wasm
         run: |
+          set -o pipefail
           echo "🔨 Building browser-wasm (release)..."
           wasm-pack build \
             --target web \
             --release \
             --out-dir "../${{ env.CI_OUT_DIR }}" \
-            --out-name "ghost_wasm"
+            --out-name "ghost_wasm" 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       # ── تأیید خروجی ────────────────────────────────────────
       - name: Verify build artifacts
@@ -101,11 +111,53 @@ jobs:
             fi
           done
 
-          # exportهای تولیدشده — برای اینکه مشخص باشد js_sys::encode_uri_component
-          # واقعاً در باینری استفاده شده است
           echo ""
           echo "🔎 Exported symbols (from .d.ts):"
           grep -E "export function" "$OUT/ghost_wasm.d.ts" || true
+
+      # ══════════════════════════════════════════════════════
+      #  در صورت شکست، خطای واقعی rustc را به annotation تبدیل
+      #  می‌کنیم تا بدون باز کردن لاگ هم قابل خواندن باشد
+      #  (و در تب Checks روی PR دیده شود)
+      # ══════════════════════════════════════════════════════
+      - name: Surface compiler errors
+        if: failure()
+        run: |
+          set -u
+          ERR="$RUNNER_TEMP/rustc-errors.txt"
+          : > "$ERR"
+
+          for f in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/build.log"; do
+            [ -f "$f" ] || continue
+            # هر بلوک خطا: از خطی که با error شروع می‌شود، تا ۶۰ خط بعد
+            awk 'BEGIN{n=0} /^error(\[|:)/{hit=1} hit{print; n++; if(n>60) exit}' \
+              "$f" >> "$ERR"
+            echo "─────────" >> "$ERR"
+          done
+
+          # اگر هیچ خط error پیدا نشد، ۴۰ خط آخر لاگ را نشان بده
+          if [ ! -s "$ERR" ]; then
+            for f in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/build.log"; do
+              [ -f "$f" ] || continue
+              echo "=== tail: $(basename "$f") ===" >> "$ERR"
+              tail -n 40 "$f" >> "$ERR"
+            done
+          fi
+
+          # حداکثر ۶۰۰۰ کاراکتر (محدودیت annotation)
+          head -c 6000 "$ERR" > "$RUNNER_TEMP/err-trim.txt"
+          [ -s "$RUNNER_TEMP/err-trim.txt" ] || echo "no log captured" > "$RUNNER_TEMP/err-trim.txt"
+
+          # escape طبق مستندات workflow commands: % → %25 ، \r → %0D
+          MSG=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' "$RUNNER_TEMP/err-trim.txt" \
+                | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
+
+          echo "::error title=Rust build failed::$MSG"
+
+          echo "### ❌ browser-wasm build failed" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/err-trim.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
         if: always()
@@ -114,8 +166,6 @@ jobs:
             echo "### ✅ browser-wasm compiled successfully" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### ❌ browser-wasm build FAILED" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "خطای کامل rustc در لاگ مرحلهٔ **Build browser-wasm** است." >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "این ورک‌فلو deploy نمی‌کند — فقط کامپایل را بررسی می‌کند." >> "$GITHUB_STEP_SUMMARY"
