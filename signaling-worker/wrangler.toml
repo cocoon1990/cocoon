@@ -1,0 +1,14 @@
+name = "ghost-signaling-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "worker-build --release"
+
+[[kv_namespaces]]
+binding = "GHOST_CONFIG"
+id = "e9277d0612d04fae97e8d0d7ac6dc87d"
+
+[vars]
+WORKER_VERSION = "5.0.0"

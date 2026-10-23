@@ -19,7 +19,7 @@ new_sqlite_classes = ["SlidingWindowRateLimiter"]
 # ── KV Namespace (Config) ─────────────────────────────────────
 [[kv_namespaces]]
 binding = "GHOST_CONFIG"
-id      = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 
 # ── Secrets (inject شده توسط wrangler یا GitHub Actions) ─────
 # HMAC_SECRET — با `wrangler secret put HMAC_SECRET` تنظیم می‌شود
