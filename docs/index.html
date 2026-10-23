@@ -542,34 +542,101 @@ async function loadWasm() {
   return mod;
 }
 
+/**
+ * ساخت پیام خطای گویا از پاسخ HTTP.
+ * — JSON → فیلد message یا error
+ * — HTML (صفحهٔ خطای Cloudflare) → <title> یا متن خالص‌شده
+ * — بقیه → متن خام
+ * — خروجی حداکثر ۲۰۰ کاراکتر، همراه با URL دقیق
+ */
+async function describeHttpFailure(resp, url, method = "POST") {
+  let raw = "";
+  try {
+    raw = (await resp.text()) || "";
+  } catch (_) {
+    raw = "";
+  }
+
+  const trimmed = raw.trim();
+  let detail = "";
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    // JSON — دقیق‌ترین منبع
+    try {
+      const parsed = JSON.parse(trimmed);
+      detail =
+        parsed.message ||
+        parsed.error ||
+        parsed.detail ||
+        trimmed;
+    } catch (_) {
+      detail = trimmed;
+    }
+  } else if (trimmed.startsWith("<")) {
+    // HTML — معمولاً صفحهٔ خطای Cloudflare (مثلاً 405 Method Not Allowed)
+    const titleMatch = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    detail = titleMatch
+      ? `HTML: ${titleMatch[1].trim()}`
+      : `HTML: ${trimmed.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()}`;
+  } else {
+    detail = trimmed;
+  }
+
+  // ۲۰۰ کاراکتر اول — جلوگیری از پر شدن UI
+  detail = String(detail || "").replace(/\s+/g, " ").trim().slice(0, 200);
+
+  const statusLine = `HTTP ${resp.status}${resp.statusText ? " " + resp.statusText : ""}`;
+  const endpoint = `${method} ${url}`;
+
+  return detail ? `${statusLine} — ${endpoint} — ${detail}` : `${statusLine} — ${endpoint}`;
+}
+
 async function fetchSessionKeys() {
+  const sessionUrl = `${SIGNALING_URL}/session-init`;
+
   try {
     log("تبادل کلید X25519 با Signaling Worker...", "info");
+    // URL دقیق همیشه لاگ می‌شود — حتی اگر درخواست به شبکه نرسد
+    log(`POST ${sessionUrl}`, "muted");
 
     // ۱. keypair موقت در Wasm
     const wasm = await loadWasm();
     const handshake = new wasm.SessionHandshake();
 
     // ۲. ارسال فقط کلید عمومی
-    const resp = await fetch(`${SIGNALING_URL}/session-init`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_pubkey: handshake.public_key_b64(),
-        client_version: SW_VERSION,
-      }),
-    });
-
-    if (resp.status === 429) {
-      const info = await resp.json().catch(() => ({}));
+    //    (Content-Type: application/json → مرورگر اول OPTIONS می‌فرستد؛
+    //     worker حالا preflight را سراسری و قبل از Router جواب می‌دهد)
+    let resp;
+    try {
+      resp = await fetch(sessionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_pubkey: handshake.public_key_b64(),
+          client_version: SW_VERSION,
+        }),
+      });
+    } catch (netErr) {
+      // خطای شبکه/CORS — مرورگر جزئیات را پنهان می‌کند
       throw new Error(
-        `محدودیت نرخ درخواست (429). ${info.retry_after_s || "چند"} ثانیه صبر کنید.`
+        `شبکه/CORS: ${netErr.message} — POST ${sessionUrl} ` +
+        `(اگر preflight رد شده باشد، این خطا معمولاً "Failed to fetch" است)`
       );
     }
 
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`HTTP ${resp.status}: ${detail.message || resp.statusText}`);
+      const detail = await describeHttpFailure(resp, sessionUrl, "POST");
+
+      if (resp.status === 429) {
+        throw new Error(`محدودیت نرخ درخواست — ${detail}`);
+      }
+      if (resp.status === 405) {
+        throw new Error(
+          `${detail} — احتمالاً preflight توسط لبه رد شده است؛ ` +
+          `origin فعلی: ${location.origin}`
+        );
+      }
+      throw new Error(detail);
     }
 
     const data = await resp.json();
@@ -597,7 +664,7 @@ async function fetchSessionKeys() {
     };
 
   } catch (err) {
-    log(`خطا در تبادل کلید: ${err.message}`, "error");
+    log(`خطا در تبادل کلید (origin=${location.origin}): ${err.message}`, "error");
     throw err;
   }
 }
