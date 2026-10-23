@@ -1,0 +1,105 @@
+# ══════════════════════════════════════════════════════════════
+#  CI — Rust Workers Build Check
+#
+#  چرا این ورک‌فلو وجود دارد؟
+#  ورک‌فلوی deploy-workers فقط روی push به main اجرا می‌شود. یعنی هیچ
+#  PRی این crateها را کامپایل نمی‌کند و خطاهای Rust تازه بعد از merge
+#  روی main (با یک worker-build چهار دقیقه‌ای) معلوم می‌شوند.
+#
+#  این ورک‌فلو فقط `cargo check` می‌زند — هیچ deploy‌ای انجام نمی‌دهد.
+# ══════════════════════════════════════════════════════════════
+name: "🧪 CI — Rust Workers Build Check"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "signaling-worker/**"
+      - "streaming-worker/**"
+      - ".github/workflows/ci-workers.yml"
+
+concurrency:
+  group: "ci-workers-${{ github.event.pull_request.number || github.ref }}-${{ matrix.worker }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read   # فقط خواندن — این ورک‌فلو deploy نمی‌کند
+
+jobs:
+  check:
+    name: "🦀 cargo check — ${{ matrix.worker }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [signaling-worker, streaming-worker]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # ── MSRV gate (همان قاعدهٔ deploy-workers) ─────────────
+      - name: Enforce crate MSRV
+        working-directory: ${{ matrix.worker }}
+        run: |
+          REQUIRED=$(grep -E '^rust-version' Cargo.toml | head -1 | cut -d'"' -f2)
+          ACTUAL=$(rustc --version | awk '{print $2}')
+          echo "required=$REQUIRED actual=$ACTUAL"
+          [ -n "$REQUIRED" ] || { echo "no rust-version pinned"; exit 0; }
+          HIGHEST=$(printf '%s\n%s\n' "$REQUIRED" "$ACTUAL" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$ACTUAL" ]; then
+            echo "::error::toolchain $ACTUAL is older than MSRV $REQUIRED"
+            exit 1
+          fi
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ matrix.worker }} -> target"
+          key: "ci-${{ matrix.worker }}-${{ hashFiles(format('{0}/Cargo.toml', matrix.worker)) }}"
+
+      - name: cargo check (wasm32-unknown-unknown)
+        working-directory: ${{ matrix.worker }}
+        run: |
+          set -o pipefail
+          cargo check --release --target wasm32-unknown-unknown 2>&1 \
+            | tee "$RUNNER_TEMP/check.log"
+          echo "✅ ${{ matrix.worker }} compiles"
+
+      # ── در صورت شکست، خطای rustc را به annotation تبدیل کن ──
+      - name: Surface compiler errors
+        if: failure()
+        run: |
+          set -u
+          LOG="$RUNNER_TEMP/check.log"
+          OUT="$RUNNER_TEMP/surfaced.txt"
+          : > "$OUT"
+
+          if [ -f "$LOG" ]; then
+            echo "size=$(wc -c < "$LOG") bytes" >> "$OUT"
+            grep -a -n -E '^(error|warning: unused)' "$LOG" | head -n 20 >> "$OUT" || true
+            echo "--- last 40 lines ---" >> "$OUT"
+            tail -n 40 "$LOG" >> "$OUT"
+          else
+            echo "(no log file was written)" >> "$OUT"
+          fi
+
+          head -c 6000 "$OUT" > "$RUNNER_TEMP/trim.txt"
+          [ -s "$RUNNER_TEMP/trim.txt" ] || echo "no log captured" > "$RUNNER_TEMP/trim.txt"
+
+          MSG=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' "$RUNNER_TEMP/trim.txt" \
+                | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
+
+          echo "::error title=Rust build failed (${{ matrix.worker }})::$MSG"
+
+          echo "### ❌ ${{ matrix.worker }} failed" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          cat "$RUNNER_TEMP/trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
