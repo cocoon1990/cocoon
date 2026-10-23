@@ -1,0 +1,54 @@
+{
+  "$schema": "./config.schema.json",
+  "version": "5.0.1",
+  "updated_at": "2025-10-24T00:00:00Z",
+  "routing_rules": [
+    {
+      "name": "global_streaming_rule",
+      "priority": 1,
+      "comment": "Routes ALL traffic to the Streaming Worker. GAS has been completely removed.",
+      "match": {
+        "url_patterns": ["*"]
+      },
+      "action": {
+        "backend": "cloudflare_stream_worker",
+        "endpoint": "/stream",
+        "pipe_mode": "ReadableStream",
+        "hmac_required": true,
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "name": "default_deny",
+      "priority": 99,
+      "comment": "Catch-all deny rule",
+      "match": {
+        "url_patterns": ["*"]
+      },
+      "action": {
+        "backend": "deny",
+        "endpoint": null,
+        "pipe_mode": null,
+        "hmac_required": false,
+        "timeout_ms": 0,
+        "status_code": 403,
+        "message": "Request denied by SCP-GHOST."
+      }
+    }
+  ],
+  "rate_limits": {
+    "streaming_rpm": 500,
+    "buffered_rpm": 2000,
+    "window_seconds": 60
+  },
+  "health_check": {
+    "interval_seconds": 30,
+    "failure_threshold": 3,
+    "success_threshold": 1,
+    "probe_timeout_ms": 5000
+  },
+  "endpoints": {
+    "cloudflare_stream_worker": "https://ghost-streaming.cocoon-de9.workers.dev",
+    "cloudflare_signaling_worker": "https://ghost-signaling.cocoon-de9.workers.dev"
+  }
+}

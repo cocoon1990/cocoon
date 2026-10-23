@@ -1,0 +1,286 @@
+# ══════════════════════════════════════════════════════════════
+#  SCP-GHOST GitOps Pipeline — Argo CD Style
+#
+#  فلسفه: GitHub = منبع حقیقت (Source of Truth)
+#  هر commit به config/ → validate → sync به Cloudflare KV
+#  اصلاح شده: Python logic به scripts/validate_config.py منتقل شد
+#  تا از IndentationError در heredoc جلوگیری شود.
+# ══════════════════════════════════════════════════════════════
+name: "🔄 GitOps — Sync Config to Cloudflare KV"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/ghost-routing-config.json"
+      - "config/config.schema.json"
+      - "scripts/validate_config.py"
+
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "Force sync even without config changes"
+        required: false
+        default: "false"
+        type: boolean
+      dry_run:
+        description: "Validate only — do not write to KV"
+        required: false
+        default: "false"
+        type: boolean
+
+  # Drift Detection — هر ۶ ساعت یک بار
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: "ghost-config-sync"
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+  CONFIG_FILE: "config/ghost-routing-config.json"
+  SCHEMA_FILE: "config/config.schema.json"
+  VALIDATOR_SCRIPT: "scripts/validate_config.py"
+  KV_CONFIG_KEY: "routing_config"
+  KV_METADATA_KEY: "sync_metadata"
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  #  JOB 1: Validate — JSON Schema + Business Logic
+  # ════════════════════════════════════════════════════════════
+  validate:
+    name: "🔍 Validate Config"
+    runs-on: ubuntu-latest
+    outputs:
+      config_version: ${{ steps.extract.outputs.version }}
+      config_hash: ${{ steps.hash.outputs.hash }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install ajv-cli (JSON Schema validator)
+        run: |
+          npm install -g ajv-cli@5 ajv-formats@3
+          echo "✅ ajv-cli: $(ajv --version)"
+
+      # ── Step A: JSON Schema Validation ────────────────────
+      - name: "[A] JSON Schema validation via ajv-cli"
+        run: |
+          ajv validate \
+            --spec=draft2020 \
+            -s "${{ env.SCHEMA_FILE }}" \
+            -d "${{ env.CONFIG_FILE }}" \
+            -c ajv-formats \
+            --all-errors \
+            --verbose
+          echo "✅ JSON Schema validation passed"
+
+      # ── Step B: Business Logic Validation ─────────────────
+      # اکنون به جای heredoc، یک فایل Python مستقل اجرا می‌شود.
+      # این روش از IndentationError جلوگیری می‌کند و maintainability بالاتری دارد.
+      - name: "[B] Business logic validation via Python script"
+        run: |
+          python3 "${{ env.VALIDATOR_SCRIPT }}" "${{ env.CONFIG_FILE }}"
+
+      # ── Step C: استخراج version و hash ───────────────────
+      - name: "[C] Extract config version"
+        id: extract
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('${{ env.CONFIG_FILE }}'))['version'])")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📌 Config version: ${VERSION}"
+
+      - name: "[D] Calculate SHA-256 hash"
+        id: hash
+        run: |
+          HASH=$(sha256sum "${{ env.CONFIG_FILE }}" | awk '{print $1}')
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "🔑 SHA-256: ${HASH}"
+
+  # ════════════════════════════════════════════════════════════
+  #  JOB 2: Sync به Cloudflare KV
+  # ════════════════════════════════════════════════════════════
+  sync:
+    name: "🚀 Sync → Cloudflare KV"
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Wrangler v4
+        run: |
+          npm install -g wrangler@4
+          echo "✅ Wrangler: $(wrangler --version)"
+
+      # ── Dry Run ───────────────────────────────────────────
+      - name: "[DRY RUN] Preview sync — no KV writes"
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "🧪 DRY RUN MODE — No changes will be made to Cloudflare KV"
+          echo ""
+          echo "Would sync key  : ${{ env.KV_CONFIG_KEY }}"
+          echo "Config version  : ${{ needs.validate.outputs.config_version }}"
+          echo "Config hash     : ${{ needs.validate.outputs.config_hash }}"
+          echo ""
+          echo "── Payload Preview ──────────────────────────────────"
+          python3 -c "import json; print(json.dumps(json.load(open('${{ env.CONFIG_FILE }}')), indent=2))"
+          echo "✅ Dry run complete — exiting without KV write"
+          exit 0
+
+      # ── Upload Config ─────────────────────────────────────
+      - name: "[1/3] Upload routing_config to Cloudflare KV"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "📤 Writing key='${{ env.KV_CONFIG_KEY }}' to KV namespace..."
+          wrangler kv key put \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_CONFIG_KEY }}" \
+            "$(cat ${{ env.CONFIG_FILE }})" \
+            --remote
+          echo "✅ routing_config written to KV"
+
+      # ── Upload Metadata ───────────────────────────────────
+      - name: "[2/3] Write sync metadata to KV"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          GHOST_COMMIT_SHA: ${{ github.sha }}
+          GHOST_CONFIG_VERSION: ${{ needs.validate.outputs.config_version }}
+          GHOST_CONFIG_HASH: ${{ needs.validate.outputs.config_hash }}
+          GHOST_ACTOR: ${{ github.actor }}
+          GHOST_RUN_ID: ${{ github.run_id }}
+          GHOST_TRIGGER: ${{ github.event_name }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          COMMIT_SHORT="${GHOST_COMMIT_SHA:0:7}"
+
+          # ساخت JSON با python3 -c در یک خط (بدون heredoc و بدون indentation)
+          # مقادیر از environment variables خوانده می‌شوند.
+          export GHOST_COMMIT_SHORT="${COMMIT_SHORT}"
+          export GHOST_TIMESTAMP="${TIMESTAMP}"
+          METADATA=$(python3 -c "import json, os; print(json.dumps({'commit_sha': os.environ['GHOST_COMMIT_SHORT'], 'commit_sha_full': os.environ['GHOST_COMMIT_SHA'], 'config_version': os.environ['GHOST_CONFIG_VERSION'], 'config_hash': os.environ['GHOST_CONFIG_HASH'], 'synced_at': os.environ['GHOST_TIMESTAMP'], 'synced_by': os.environ['GHOST_ACTOR'], 'run_id': os.environ['GHOST_RUN_ID'], 'trigger': os.environ['GHOST_TRIGGER'], 'status': 'synced'}))")
+
+          wrangler kv key put \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_METADATA_KEY }}" \
+            "$METADATA" \
+            --remote
+          echo "✅ sync_metadata written to KV"
+          echo "$METADATA" | python3 -m json.tool
+
+      # ── Smoke Test ────────────────────────────────────────
+      - name: "[3/3] Smoke test — verify KV content"
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "🔬 Running smoke test (waiting 3s for propagation)..."
+          sleep 3
+
+          KV_CONTENT=$(wrangler kv key get \
+            --namespace-id="${{ secrets.CF_KV_NAMESPACE_ID }}" \
+            "${{ env.KV_CONFIG_KEY }}" \
+            --remote 2>/dev/null)
+
+          if [ -z "$KV_CONTENT" ]; then
+            echo "❌ SMOKE TEST FAILED: KV returned empty content"
+            exit 1
+          fi
+
+          KV_VERSION=$(python3 -c "import json, sys; print(json.loads(sys.argv[1])['version'])" "$KV_CONTENT")
+          EXPECTED="${{ needs.validate.outputs.config_version }}"
+
+          if [ "$KV_VERSION" = "$EXPECTED" ]; then
+            echo "✅ SMOKE TEST PASSED"
+            echo "   KV version   : $KV_VERSION"
+            echo "   Expected     : $EXPECTED"
+          else
+            echo "❌ SMOKE TEST FAILED: Version mismatch"
+            echo "   KV version   : $KV_VERSION"
+            echo "   Expected     : $EXPECTED"
+            exit 1
+          fi
+
+          python3 -c "import json, sys; json.loads(sys.argv[1])" "$KV_CONTENT"
+          echo "✅ KV content is valid JSON"
+
+  # ════════════════════════════════════════════════════════════
+  #  JOB 3: Notify Workers
+  # ════════════════════════════════════════════════════════════
+  notify:
+    name: "📡 Notify Workers"
+    runs-on: ubuntu-latest
+    needs: [validate, sync]
+    if: ${{ github.event.inputs.dry_run != 'true' }}
+
+    steps:
+      - name: Send reload hint to Signaling Worker
+        env:
+          CF_SIGNALING_URL: ${{ secrets.CF_SIGNALING_URL }}
+          GHOST_RELOAD_TOKEN: ${{ secrets.GHOST_RELOAD_TOKEN }}
+          GHOST_COMMIT_SHA: ${{ github.sha }}
+          GHOST_CONFIG_VERSION: ${{ needs.validate.outputs.config_version }}
+        run: |
+          # ساخت JSON در یک خط (بدون heredoc و بدون indentation)
+          PAYLOAD=$(python3 -c "import json, os, time; print(json.dumps({'source': 'gitops', 'commit': os.environ['GHOST_COMMIT_SHA'], 'version': os.environ['GHOST_CONFIG_VERSION'], 'timestamp': str(int(time.time()))}))")
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${CF_SIGNALING_URL}/admin/reload-config" \
+            -H "Authorization: Bearer ${GHOST_RELOAD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            --max-time 10 \
+            --connect-timeout 5 || echo "000")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Workers notified (HTTP 200)"
+          else
+            echo "⚠️  Reload hint returned HTTP ${HTTP_STATUS} (non-fatal)"
+            echo "   Workers will pick up new config from KV on next request"
+          fi
+
+      - name: Create GitHub Deployment Status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: dep } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: `Config v${{ needs.validate.outputs.config_version }} synced to KV`,
+              auto_merge: false,
+              required_contexts: []
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: dep.id,
+              state: 'success',
+              description: `Ghost routing config v${{ needs.validate.outputs.config_version }} live`,
+              environment_url: `${{ secrets.CF_SIGNALING_URL }}/health`
+            });
+            core.info(`✅ GitHub Deployment #${dep.id} marked as success`);

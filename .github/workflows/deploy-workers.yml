@@ -1,0 +1,256 @@
+# ══════════════════════════════════════════════════════════════
+#  SCP-GHOST Worker Deploy Pipeline
+#
+#  Builds streaming-worker و signaling-worker در Rust
+#  و آن‌ها را با Wrangler به Cloudflare Edge deploy می‌کند.
+#  فقط وقتی کد Worker تغییر کند اجرا می‌شود.
+# ══════════════════════════════════════════════════════════════
+name: "⚙️ Build & Deploy — Rust Workers"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "streaming-worker/**"
+      - "signaling-worker/**"
+
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Which worker to deploy"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - streaming
+          - signaling
+
+concurrency:
+  group: "ghost-worker-deploy-${{ github.ref }}"
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  #  Build و Deploy: Streaming Worker
+  # ════════════════════════════════════════════════════════════
+  deploy-streaming:
+    name: "🦀 Streaming Worker — Build & Deploy"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.worker == 'both' ||
+      github.event.inputs.worker == 'streaming'
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Rust Toolchain ─────────────────────────────────────
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # ── Cache ──────────────────────────────────────────────
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "streaming-worker -> target"
+          key: "streaming-worker-${{ hashFiles('streaming-worker/Cargo.lock') }}"
+
+      # ── Node.js + worker-build ─────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install worker-build
+        run: |
+          cargo install worker-build --locked
+          echo "✅ worker-build: $(worker-build --version)"
+
+      # ── Build ──────────────────────────────────────────────
+      - name: Build streaming-worker (Rust → Wasm)
+        working-directory: streaming-worker
+        run: |
+          echo "🔨 Building streaming-worker in release mode..."
+          worker-build --release
+          echo ""
+          echo "📦 Build output:"
+          ls -lh build/worker/
+          echo ""
+          echo "📊 Wasm size: $(du -sh build/worker/*.wasm 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+
+      # ── CRITICAL GUARD ─────────────────────────────────────
+      # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
+      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
+        working-directory: streaming-worker
+        run: |
+          echo "🔍 Verifying worker-build output (Rust → Wasm)..."
+          test -f build/worker/shim.mjs || {
+            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
+            exit 1
+          }
+          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
+          if [ "$WASM_COUNT" -lt 1 ]; then
+            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+            exit 1
+          fi
+          echo "✅ shim.mjs present"
+          find build/worker -name '*.wasm' -exec ls -lh {} \;
+          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+
+      # ── Deploy ─────────────────────────────────────────────
+      - name: Deploy streaming-worker to Cloudflare Edge
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy
+          workingDirectory: streaming-worker
+          secrets: |
+            HMAC_SECRET
+        env:
+          HMAC_SECRET: ${{ secrets.HMAC_SECRET }}
+
+      # ── Health Check بعد از Deploy ─────────────────────────
+      - name: Post-deploy health check
+        run: |
+          echo "🔬 Waiting 5s for deployment propagation..."
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.CF_STREAMING_URL }}/health" \
+            --max-time 15)
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Streaming Worker is healthy (HTTP 200)"
+          else
+            echo "❌ Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+
+  # ════════════════════════════════════════════════════════════
+  #  Build و Deploy: Signaling Worker
+  # ════════════════════════════════════════════════════════════
+  deploy-signaling:
+    name: "📡 Signaling Worker — Build & Deploy"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.worker == 'both' ||
+      github.event.inputs.worker == 'signaling'
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "signaling-worker -> target"
+          key: "signaling-worker-${{ hashFiles('signaling-worker/Cargo.lock') }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install worker-build
+        run: cargo install worker-build --locked
+
+      - name: Build signaling-worker (Rust → Wasm)
+        working-directory: signaling-worker
+        run: |
+          echo "🔨 Building signaling-worker in release mode..."
+          worker-build --release
+          echo "📦 Build output:"
+          ls -lh build/worker/
+
+      # ── CRITICAL GUARD ─────────────────────────────────────
+      # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
+      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
+        working-directory: signaling-worker
+        run: |
+          echo "🔍 Verifying worker-build output (Rust → Wasm)..."
+          test -f build/worker/shim.mjs || {
+            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
+            exit 1
+          }
+          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
+          if [ "$WASM_COUNT" -lt 1 ]; then
+            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+            exit 1
+          fi
+          echo "✅ shim.mjs present"
+          find build/worker -name '*.wasm' -exec ls -lh {} \;
+          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+
+      - name: Deploy signaling-worker to Cloudflare Edge
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy
+          workingDirectory: signaling-worker
+          secrets: |
+            HMAC_SECRET
+            GHOST_RELOAD_TOKEN
+        env:
+          HMAC_SECRET: ${{ secrets.HMAC_SECRET }}
+          GHOST_RELOAD_TOKEN: ${{ secrets.GHOST_RELOAD_TOKEN }}
+
+      - name: Post-deploy health check
+        run: |
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.CF_SIGNALING_URL }}/health" \
+            --max-time 15)
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Signaling Worker is healthy (HTTP 200)"
+          else
+            echo "❌ Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+
+  # ════════════════════════════════════════════════════════════
+  #  Summary Job
+  # ════════════════════════════════════════════════════════════
+  summary:
+    name: "📋 Deployment Summary"
+    runs-on: ubuntu-latest
+    needs: [deploy-streaming, deploy-signaling]
+    if: always()
+
+    steps:
+      - name: Print deployment summary
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  SCP-GHOST Worker Deployment Summary"
+          echo "══════════════════════════════════════════"
+          echo "  Streaming : ${{ needs.deploy-streaming.result }}"
+          echo "  Signaling : ${{ needs.deploy-signaling.result }}"
+          echo "  Commit    : ${{ github.sha }}"
+          echo "  Actor     : ${{ github.actor }}"
+          echo "══════════════════════════════════════════"
+
+          # اگر یکی از workers شکست خورد، job را fail کن
+          if [ "${{ needs.deploy-streaming.result }}" = "failure" ] || \
+             [ "${{ needs.deploy-signaling.result }}" = "failure" ]; then
+            echo "❌ One or more deployments failed"
+            exit 1
+          fi
+          echo "✅ All deployments succeeded"

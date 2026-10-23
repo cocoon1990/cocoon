@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOUR_USERNAME/scp-ghost/config/config.schema.json",
+  "title": "SCP-GHOST Routing Config",
+  "type": "object",
+  "required": ["version", "routing_rules", "rate_limits", "health_check"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "routing_rules": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["name", "priority", "match", "action"],
+        "additionalProperties": false,
+        "properties": {
+          "name":    { "type": "string", "minLength": 1 },
+          "priority":{ "type": "integer", "minimum": 1, "maximum": 99 },
+          "comment": { "type": "string" },
+          "match": {
+            "type": "object",
+            "required": ["url_patterns"],
+            "additionalProperties": false,
+            "properties": {
+              "url_patterns": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" }
+              },
+              "min_size_bytes": { "type": "integer", "minimum": 0 },
+              "max_size_bytes": { "type": "integer", "minimum": 0 },
+              "content_types": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          },
+          "action": {
+            "type": "object",
+            "required": ["backend"],
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "type": "string",
+                "enum": [
+                  "cloudflare_stream_worker",
+                  "cloudflare_signaling_worker",
+                  "deny"
+                ]
+              },
+              "endpoint":      { "type": ["string", "null"] },
+              "pipe_mode":     { "type": ["string", "null"] },
+              "hmac_required": { "type": "boolean" },
+              "timeout_ms":    { "type": "integer", "minimum": 0 },
+              "strategy":      { "type": "string" },
+              "endpoints": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "failover":    { "type": "string" },
+              "status_code": { "type": "integer" },
+              "message":     { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "rate_limits": {
+      "type": "object",
+      "required": ["streaming_rpm", "window_seconds"],
+      "properties": {
+        "streaming_rpm": { "type": "integer", "minimum": 1 },
+        "buffered_rpm":  { "type": "integer", "minimum": 1 },
+        "window_seconds":{ "type": "integer", "minimum": 1 }
+      }
+    },
+    "health_check": {
+      "type": "object",
+      "required": ["interval_seconds", "failure_threshold", "success_threshold"],
+      "properties": {
+        "interval_seconds":  { "type": "integer", "minimum": 5 },
+        "failure_threshold": { "type": "integer", "minimum": 1 },
+        "success_threshold": { "type": "integer", "minimum": 1 },
+        "probe_timeout_ms":  { "type": "integer", "minimum": 100 }
+      }
+    },
+    "endpoints": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "format": "uri" }
+    }
+  }
+}

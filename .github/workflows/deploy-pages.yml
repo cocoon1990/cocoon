@@ -1,0 +1,136 @@
+# ══════════════════════════════════════════════════════════════
+#  SCP-GHOST Pages Deploy Pipeline
+#
+#  browser-wasm را با wasm-pack می‌سازد و همراه با
+#  docs/sw.js و docs/index.html به GitHub Pages deploy می‌کند.
+# ══════════════════════════════════════════════════════════════
+name: "🌐 Build & Deploy — GitHub Pages"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "browser-wasm/**"
+      - "docs/**"
+
+  workflow_dispatch: {}
+
+concurrency:
+  group: "ghost-pages-deploy"
+  cancel-in-progress: true
+
+env:
+  WASM_OUT_DIR: "docs/wasm"
+
+jobs:
+  build-and-deploy:
+    name: "🦀 wasm-pack Build → GitHub Pages"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # برای push به gh-pages branch
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Rust Toolchain ─────────────────────────────────────
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "browser-wasm -> target"
+          key: "browser-wasm-${{ hashFiles('browser-wasm/Cargo.lock') }}"
+
+      # ── wasm-pack ──────────────────────────────────────────
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          echo "✅ wasm-pack: $(wasm-pack --version)"
+
+      # ── Build ──────────────────────────────────────────────
+      - name: Build browser-wasm (Rust → Wasm ES Module)
+        working-directory: browser-wasm
+        run: |
+          echo "🔨 Building browser-wasm..."
+          wasm-pack build \
+            --target web \
+            --release \
+            --out-dir "../${{ env.WASM_OUT_DIR }}" \
+            --out-name "ghost_wasm"
+
+          echo ""
+          echo "📦 Wasm output:"
+          ls -lh "../${{ env.WASM_OUT_DIR }}/"
+          echo ""
+          WASM_SIZE=$(du -sh "../${{ env.WASM_OUT_DIR }}/ghost_wasm_bg.wasm" | awk '{print $1}')
+          echo "📊 Wasm binary size: $WASM_SIZE"
+
+      # ── Inject runtime config به sw.js ────────────────────
+      # URL های Worker در زمان build به Service Worker تزریق می‌شوند
+      - name: Inject Cloudflare endpoint URLs into sw.js
+        env:
+          CF_STREAMING_URL: ${{ secrets.CF_STREAMING_URL }}
+          CF_SIGNALING_URL: ${{ secrets.CF_SIGNALING_URL }}
+        run: |
+          # جایگزینی placeholder ها با URL های واقعی
+          sed -i \
+            -e "s|__CF_STREAMING_URL__|${CF_STREAMING_URL}|g" \
+            -e "s|__CF_SIGNALING_URL__|${CF_SIGNALING_URL}|g" \
+            docs/sw.js
+
+          echo "✅ Injected endpoints into sw.js:"
+          grep -n "STREAMING_WORKER_URL\|SIGNALING_WORKER_URL" docs/sw.js | head -5
+
+      # ── حذف فایل‌های اضافی wasm-pack ─────────────────────
+      - name: Clean up unnecessary wasm-pack artifacts
+        run: |
+          # package.json و README که wasm-pack تولید می‌کند لازم نیستند
+          rm -f "${{ env.WASM_OUT_DIR }}/package.json"
+          rm -f "${{ env.WASM_OUT_DIR }}/README.md"
+          rm -f "${{ env.WASM_OUT_DIR }}/.gitignore"
+          echo "✅ Cleaned wasm output directory"
+
+      # ── تأیید فایل‌های نهایی ───────────────────────────────
+      - name: Verify deployment artifacts
+        run: |
+          echo "📁 Final docs/ structure:"
+          find docs/ -type f | sort
+          echo ""
+          echo "Required files check:"
+          for f in "docs/index.html" "docs/sw.js" \
+                   "docs/wasm/ghost_wasm.js" \
+                   "docs/wasm/ghost_wasm_bg.wasm"; do
+            if [ -f "$f" ]; then
+              echo "  ✅ $f ($(du -sh $f | awk '{print $1}'))"
+            else
+              echo "  ❌ MISSING: $f"
+              exit 1
+            fi
+          done
+
+      # ── Deploy به GitHub Pages ─────────────────────────────
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: |
+            deploy: SCP-GHOST Pages — ${{ github.sha }}
+
+            Wasm: browser-wasm built with wasm-pack
+            Trigger: ${{ github.event_name }}
+            Actor: ${{ github.actor }}
+
+      - name: Print deployment URL
+        run: |
+          REPO="${{ github.repository }}"
+          OWNER="${REPO%%/*}"
+          REPO_NAME="${REPO##*/}"
+          echo "✅ Deployed to: https://${OWNER}.github.io/${REPO_NAME}/"
