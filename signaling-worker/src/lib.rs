@@ -43,6 +43,10 @@
 //! ══════════════════════════════════════════════════════════════
 //!   • منبع: var به نام `ALLOWED_ORIGIN` (چند مقدار با کاما)
 //!   • origin درخواست echo می‌شود + هدر `Vary: Origin`
+//!   • preflight سراسری: هر OPTIONS — روی هر مسیری — قبل از Router در
+//!     `main()` پاسخ می‌گیرد (204)، پس هرگز 405 نمی‌شود
+//!   • `finalize()` هدر CORS را روی *همهٔ* پاسخ‌ها تضمین می‌کند
+//!     و بدنهٔ 404/405 را به JSON گویا تبدیل می‌کند
 //!   • origin غیرمجاز → preflight با 403 و بدون هیچ هدر CORS
 //!   • درخواست بدون Origin (curl / health check) → origin اصلی
 //!
@@ -416,9 +420,30 @@ struct SessionInitRequest {
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // ══════════════════════════════════════════════════════════
+    //  MIDDLEWARE ۱ — preflight سراسری
+    //
+    //  هر درخواست OPTIONS، برای **هر مسیری** (حتی مسیرهایی که هنوز
+    //  ساخته نشده‌اند)، همین‌جا و قبل از Router پاسخ می‌گیرد.
+    //
+    //  چرا این‌طور: در worker 0.8.7 تابع `Router::run` اگر برای متدِ
+    //  درخواست هندلری پیدا نکند، قبل از هر fallback این را برمی‌گرداند:
+    //      return Response::error("Method Not Allowed", 405);
+    //  یعنی هندلرهای per-route و or_else هرگز به OPTIONS نمی‌رسند و
+    //  هر مسیر جدید دوباره 405 می‌دهد. با interceptor سراسری، این کلاس
+    //  از باگ‌ها برای همیشه بسته می‌شود.
+    // ══════════════════════════════════════════════════════════
+    let req_origin = request_origin(&req);
+
+    if req.method() == Method::Options {
+        return cors_preflight(&env, req_origin.as_deref());
+    }
+
+    let resolved_origin = matching_origin(&env, req_origin.as_deref());
+
     let router = Router::new();
 
-    router
+    let response = router
         // ── GET /health ────────────────────────────────────────
         .get_async("/health", |req, ctx| async move {
             let req_origin = request_origin(&req);
@@ -434,10 +459,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             Ok(Response::ok(body)?.with_headers(json_headers(origin.as_deref())?))
         })
-        .options_async("/health", |req, ctx| async move {
-            let req_origin = request_origin(&req);
-            cors_preflight(&ctx.env, req_origin.as_deref())
-        })
         // ── GET /config ────────────────────────────────────────
         .get_async("/config", |req, ctx| async move {
             let req_origin = request_origin(&req);
@@ -451,10 +472,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or_else(|| "{}".to_string());
 
             Ok(Response::ok(config)?.with_headers(json_headers(origin.as_deref())?))
-        })
-        .options_async("/config", |req, ctx| async move {
-            let req_origin = request_origin(&req);
-            cors_preflight(&ctx.env, req_origin.as_deref())
         })
         // ── POST /session-init ─────────────────────────────────
         .post_async("/session-init", |mut req, ctx| async move {
@@ -476,7 +493,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             if let Some(info) = check_rate_limit(&ctx, &client_ip, "session-init").await? {
                 let retry_secs = (info.retry_after_ms.unwrap_or(60_000) / 1000).max(1);
-                let mut headers = json_headers(origin.as_deref())?;
+                let headers = json_headers(origin.as_deref())?;
                 headers.set("Retry-After", &retry_secs.to_string())?;
                 headers.set("X-RateLimit-Limit", &info.limit.to_string())?;
                 headers.set("X-RateLimit-Remaining", "0")?;
@@ -583,17 +600,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "salt": B64.encode(salt),
                 "wrapped": B64.encode(wrapped),
                 "gas_endpoints": [],
-                "config_version": "5.1.0"
+                "config_version": "5.1.1"
             })
             .to_string();
 
             Ok(Response::ok(body)?.with_headers(json_headers(origin.as_deref())?))
         })
         // preflight — بدون این، مرورگر preflight را با 405 رد می‌کند
-        .options_async("/session-init", |req, ctx| async move {
-            let req_origin = request_origin(&req);
-            cors_preflight(&ctx.env, req_origin.as_deref())
-        })
         // ── POST /admin/reload-config ──────────────────────────
         .post_async("/admin/reload-config", |mut req, ctx| async move {
             let req_origin = request_origin(&req);
@@ -605,12 +618,65 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Ok(Response::ok(json!({"status": "acknowledged"}).to_string())?
                 .with_headers(json_headers(origin.as_deref())?))
         })
-        .options_async("/admin/reload-config", |req, ctx| async move {
-            let req_origin = request_origin(&req);
-            cors_preflight(&ctx.env, req_origin.as_deref())
-        })
         .run(req, env)
-        .await
+        .await?;
+
+    // ══════════════════════════════════════════════════════════
+    //  MIDDLEWARE ۲ — finalize
+    //  هر پاسخی (موفق یا خطا، حتی 404/405) از اینجا رد می‌شود تا
+    //  هدرهای CORS همیشه حاضر باشند و بدنهٔ خطاها JSON گویا باشد
+    //  (نه صفحهٔ HTML پیش‌فرض که دیباگ را غیرممکن می‌کند).
+    // ══════════════════════════════════════════════════════════
+    finalize(response, resolved_origin.as_deref())
+}
+
+/// مسیرهای شناخته‌شده — برای پیام خطای گویا
+const KNOWN_ENDPOINTS: [&str; 4] = [
+    "GET /health",
+    "GET /config",
+    "POST /session-init",
+    "POST /admin/reload-config",
+];
+
+/// آخرین مرحلهٔ هر پاسخ: CORS تضمینی + بدنهٔ JSON برای 404/405.
+fn finalize(mut res: Response, origin: Option<&str>) -> Result<Response> {
+    let status = res.status_code();
+
+    // ── خطاهای مسیر/متد: بدنهٔ JSON قابل دیباگ ──────────────
+    if status == 404 || status == 405 {
+        let (error, message) = if status == 405 {
+            (
+                "method_not_allowed",
+                "This method is not allowed for this path. \
+                 Preflight (OPTIONS) is handled globally; \
+                 this 405 is for the real request method.",
+            )
+        } else {
+            (
+                "not_found",
+                "Unknown path. Check the URL — the endpoint list is in 'endpoints'.",
+            )
+        };
+
+        let body = json!({
+            "error": error,
+            "message": message,
+            "protocol": PROTOCOL,
+            "endpoints": KNOWN_ENDPOINTS,
+        })
+        .to_string();
+
+        return Ok(Response::error(body, status)?.with_headers(json_headers(origin)?));
+    }
+
+    // ── بقیهٔ پاسخ‌ها: CORS را اگر نبود اضافه کن ────────────
+    let headers = res.headers_mut();
+    if let Some(origin) = origin {
+        let _ = headers.set("Access-Control-Allow-Origin", origin);
+    }
+    let _ = headers.set("Vary", "Origin");
+
+    Ok(res)
 }
 
 /// پاسخ 500 با هدرهای CORS
