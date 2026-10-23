@@ -8,6 +8,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wasm-bindgen  = "0.2.100"
+# js-sys: برای js_sys::encode_uri_component در src/lib.rs:105
+# (wasm-bindgen این crate را re-export نمی‌کند، پس باید مستقیم اعلام شود)
+js-sys        = "0.3"
 serde         = { version = "1.0", features = ["derive"] }
 serde_json    = "1.0"
 # serde-wasm-bindgen برای تبادل صحیح داده بین Rust و JS
@@ -21,6 +24,16 @@ getrandom     = { version = "0.2", features = ["js"] }
 hex           = "0.4"
 # برای panic hook در browser
 console_error_panic_hook = "0.1"
+
+# ── تنظیمات wasm-opt (binaryen) ────────────────────────────────
+# Rust جدید (۱.۸x+) برای wasm32-unknown-unknown به صورت پیش‌فرض
+# bulk-memory را فعال می‌کند. نسخه‌ای که wasm-pack دانلود می‌کند
+# این قابلیت را پیش‌فرض روشن نمی‌کند و بیلد با این خطا می‌شکند:
+#   [wasm-validator error] Bulk memory operations require bulk memory
+#   Error: failed to execute `wasm-opt`
+# پس باید صریح فعال شود.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [profile.release]
 opt-level     = "z"

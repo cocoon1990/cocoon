@@ -4,10 +4,10 @@
 //! PhantomSession (مدیریت کلیدها) را export می‌کند.
 
 use wasm_bindgen::prelude::*;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Key,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -96,7 +96,9 @@ impl PhantomSession {
 
         let message = format!("{}:{}", target_url, seq);
 
-        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
+        // ابهام‌زدایی: هم KeyInit و هم Mac متد new_from_slice دارند.
+        // برای HMAC باید نسخهٔ Mac صدا زده شود (کلید با طول دلخواه).
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.hmac_key)
             .map_err(|e| JsValue::from_str(&format!("HMAC init error: {e}")))?;
         mac.update(message.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());

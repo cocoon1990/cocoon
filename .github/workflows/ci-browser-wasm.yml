@@ -1,0 +1,174 @@
+# ══════════════════════════════════════════════════════════════
+#  CI — browser-wasm Build Check
+#
+#  چرا این ورک‌فلو وجود دارد؟
+#  ورک‌فلوی deploy-pages فقط روی push به main و workflow_dispatch
+#  اجرا می‌شود. یعنی هیچ PRی هرگز کامپایل نمی‌شد و خطاهای Rust
+#  تازه بعد از merge روی main ظاهر می‌شدند.
+#
+#  این ورک‌فلو یک build تمیز و بدون deploy انجام می‌دهد و نتیجه را
+#  به عنوان status check روی PR گزارش می‌کند.
+#
+#  ⚠️ این ورک‌فلو هیچ چیزی را deploy نمی‌کند — فقط کامپایل.
+# ══════════════════════════════════════════════════════════════
+name: "🧪 CI — browser-wasm Build Check"
+
+on:
+  # ── اجرای دستی ────────────────────────────────────────────────
+  workflow_dispatch:
+
+  # ── روی هر PR که به browser-wasm دست بزند ─────────────────────
+  pull_request:
+    paths:
+      - "browser-wasm/**"
+      # تغییر در خودِ این ورک‌فلو هم باید تست شود
+      - ".github/workflows/ci-browser-wasm.yml"
+
+# اجراهای قبلی همان PR لغو می‌شوند — صرفه‌جویی در دقیقه CI
+concurrency:
+  group: "ci-browser-wasm-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read   # فقط خواندن — این ورک‌فلو deploy نمی‌کند
+
+env:
+  # خارج از docs/ می‌سازیم تا هیچ‌وقت با خروجی واقعی Pages قاطی نشود
+  CI_OUT_DIR: "target/ci-wasm"
+
+jobs:
+  build-check:
+    name: "🦀 wasm-pack build (no deploy)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Rust Toolchain ─────────────────────────────────────
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "browser-wasm -> target"
+          # به Cargo.toml وابسته است، نه Cargo.lock (چون lock در مخزن نیست)
+          key: "ci-browser-wasm-${{ hashFiles('browser-wasm/Cargo.toml') }}"
+
+      # ── wasm-pack ──────────────────────────────────────────
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          echo "✅ wasm-pack: $(wasm-pack --version)"
+
+      # ── وابستگی‌ها باید resolve شوند (این مرحله سریع شکست می‌خورد
+      #    اگر نسخه‌ها ناسازگار باشند — قبل از build طولانی) ──
+      - name: Resolve dependencies (cargo metadata)
+        working-directory: browser-wasm
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          echo "✅ dependency graph resolved"
+          cargo tree -p ghost-browser-wasm --depth 1 2>/dev/null | head -20 || true
+
+      # ── cargo check: سریع‌ترین راه برای گرفتن خطاهای کامپایل ──
+      - name: cargo check (fast compile gate)
+        id: check
+        working-directory: browser-wasm
+        run: |
+          set -o pipefail
+          cargo check --release --target wasm32-unknown-unknown 2>&1 \
+            | tee "$RUNNER_TEMP/check.log"
+
+      # ── Build ──────────────────────────────────────────────
+      - name: Build browser-wasm (Rust → Wasm)
+        working-directory: browser-wasm
+        run: |
+          set -o pipefail
+          echo "🔨 Building browser-wasm (release)..."
+          wasm-pack build \
+            --target web \
+            --release \
+            --out-dir "../${{ env.CI_OUT_DIR }}" \
+            --out-name "ghost_wasm" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # ── تأیید خروجی ────────────────────────────────────────
+      - name: Verify build artifacts
+        run: |
+          OUT="${{ env.CI_OUT_DIR }}"
+          echo "📦 Output: $OUT"
+          ls -lh "$OUT"
+
+          for f in "ghost_wasm.js" "ghost_wasm_bg.wasm" "ghost_wasm.d.ts"; do
+            if [ -f "$OUT/$f" ]; then
+              echo "  ✅ $f ($(du -h "$OUT/$f" | awk '{print $1}'))"
+            else
+              echo "  ❌ MISSING: $f"
+              exit 1
+            fi
+          done
+
+          echo ""
+          echo "🔎 Exported symbols (from .d.ts):"
+          grep -E "export function" "$OUT/ghost_wasm.d.ts" || true
+
+      # ══════════════════════════════════════════════════════
+      #  در صورت شکست، خطای واقعی rustc را به annotation تبدیل
+      #  می‌کنیم تا بدون باز کردن لاگ هم قابل خواندن باشد
+      #  (و در تب Checks روی PR دیده شود)
+      # ══════════════════════════════════════════════════════
+      - name: Surface compiler errors
+        if: failure()
+        run: |
+          set -u
+          ERR="$RUNNER_TEMP/surfaced.txt"
+          : > "$ERR"
+
+          for name in check.log build.log; do
+            f="$RUNNER_TEMP/$name"
+            echo "===== $name =====" >> "$ERR"
+
+            if [ ! -f "$f" ]; then
+              echo "(no log file was written)" >> "$ERR"
+              continue
+            fi
+
+            echo "size=$(wc -c < "$f") bytes, lines=$(wc -l < "$f")" >> "$ERR"
+
+            # --- بلوک‌های خطا (اگر وجود داشتند) ---
+            grep -a -n -E '^(error|warning: unused)' "$f" | head -n 20 >> "$ERR" || true
+
+            # --- همیشه ۴۰ خط آخر: تضمین می‌کند هیچ خطایی پنهان نماند ---
+            echo "--- last 40 lines ---" >> "$ERR"
+            tail -n 40 "$f" >> "$ERR"
+            echo "" >> "$ERR"
+          done
+
+          # حداکثر ۶۰۰۰ کاراکتر (محدودیت annotation)
+          head -c 6000 "$ERR" > "$RUNNER_TEMP/err-trim.txt"
+          [ -s "$RUNNER_TEMP/err-trim.txt" ] || echo "no log captured" > "$RUNNER_TEMP/err-trim.txt"
+
+          # escape طبق مستندات workflow commands: % → %25 ، \r → %0D
+          MSG=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' "$RUNNER_TEMP/err-trim.txt" \
+                | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
+
+          echo "::error title=Rust build failed::$MSG"
+
+          echo "### ❌ browser-wasm build failed" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          cat "$RUNNER_TEMP/err-trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ browser-wasm compiled successfully" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          else
+            echo "### ❌ browser-wasm build FAILED" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+          echo "" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "این ورک‌فلو deploy نمی‌کند — فقط کامپایل را بررسی می‌کند." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
