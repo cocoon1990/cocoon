@@ -48,7 +48,7 @@
     "probe_timeout_ms": 5000
   },
   "endpoints": {
-    "cloudflare_stream_worker": "https://ghost-streaming.cocoon-de9.workers.dev",
-    "cloudflare_signaling_worker": "https://ghost-signaling.cocoon-de9.workers.dev"
+    "cloudflare_stream_worker": "https://ghost-streaming-worker.cocoon-de9.workers.dev",
+    "cloudflare_signaling_worker": "https://ghost-signaling-worker.cocoon-de9.workers.dev"
   }
 }
