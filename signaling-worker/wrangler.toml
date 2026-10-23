@@ -6,15 +6,40 @@ compatibility_flags = ["nodejs_compat"]
 [build]
 command = "worker-build --release"
 
+# ── Durable Objects (Rate Limiting) ────────────────────────────
+# یک instance به‌ازای هر IP → sharding خودکار و شمارش strongly-consistent.
+[[durable_objects.bindings]]
+name       = "RATE_LIMITER"
+class_name = "SignalingRateLimiter"
+
+# new_sqlite_classes برای فعال‌سازی SQLite API داخل DO
+[[migrations]]
+tag                = "v1"
+new_sqlite_classes = ["SignalingRateLimiter"]
+
 [[kv_namespaces]]
 binding = "GHOST_CONFIG"
-id = "e9277d0612d04fae97e8d0d7ac6dc87d"
+id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
+
+# ── Secrets (با `wrangler secret put` تنظیم می‌شوند) ────────────
+# HMAC_SECRET — کلید امضای درخواست‌ها (streaming-worker هم همین را
+#               برای verify استفاده می‌کند)
+# AES_KEY     — کلید ۳۲ بایتی به شکل hex (۶۴ کاراکتر)
+# ⚠️ هیچ‌کدام نباید در این فایل یا در سورس قرار بگیرند.
 
 [vars]
-WORKER_VERSION = "5.0.0"
+WORKER_VERSION = "5.1.0"
+
 # ── CORS allowlist ─────────────────────────────────────────────
 # فقط این origin(ها) می‌توانند پاسخ‌های cross-origin را بخوانند.
-# چند مقدار با کاما جدا می‌شود (مثلاً دامنهٔ سفارشی + github.io).
-# این var در signaling-worker/src/lib.rs خوانده می‌شود؛ اگر حذف شود،
-# کد به مقدار پیش‌فرض امن خودش (همین آدرس) برمی‌گردد.
-ALLOWED_ORIGIN = "https://cocoon1990.github.io"
+# چند مقدار با کاما جدا می‌شود.
+#   • https://cocoon1990.github.io → UI وب (GitHub Pages)
+#   • tauri://localhost            → Windows Desktop App (Tauri)
+# اگر این var حذف شود، کد به مقدار پیش‌فرض امن خودش برمی‌گردد.
+ALLOWED_ORIGIN = "https://cocoon1990.github.io,tauri://localhost"
+
+# ── Rate limiting ──────────────────────────────────────────────
+# ۲۰ درخواست در دقیقه به‌ازای هر IP برای /session-init.
+# UI در هر بار لود صفحه یک بار صدا می‌زند، پس این سقف بسیار سخاوتمندانه است.
+RATE_LIMIT_RPM = "20"
+RATE_WINDOW_MS = "60000"

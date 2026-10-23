@@ -24,6 +24,11 @@ getrandom     = { version = "0.2", features = ["js"] }
 hex           = "0.4"
 # برای panic hook در browser
 console_error_panic_hook = "0.1"
+# ── تبادل کلید X25519 (همان پروتکل signaling-worker) ──────────
+# static_secrets → StaticSecret::from([u8;32]) با seed از getrandom
+x25519-dalek  = { version = "2", features = ["static_secrets"] }
+hkdf          = "0.12"
+base64        = "0.22"
 
 # ── تنظیمات wasm-opt (binaryen) ────────────────────────────────
 # Rust جدید (۱.۸x+) برای wasm32-unknown-unknown به صورت پیش‌فرض

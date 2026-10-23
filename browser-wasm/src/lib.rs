@@ -6,11 +6,14 @@
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroize;
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key,
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    Aes256Gcm, Key, Nonce,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use hkdf::Hkdf;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub mod router;
 
@@ -167,4 +170,142 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         .zip(b.bytes())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SessionHandshake — تبادل کلید X25519 با signaling-worker
+//
+//  پروتکل `x25519-hkdf-sha256-aesgcm-v1` (باید دقیقاً با
+//  signaling-worker/src/lib.rs یکی باشد):
+//
+//    1. new()                → keypair موقت؛ کلید خصوصی هرگز خارج نمی‌شود
+//    2. public_key_b64()     → به /session-init فرستاده می‌شود
+//    3. complete(...)        → KEK را می‌سازد و payload را باز می‌کند
+//
+//  ⚠️ کلید خصوصی در حافظهٔ Wasm می‌ماند و با drop پاک (zeroize) می‌شود.
+// ══════════════════════════════════════════════════════════════
+
+/// info در HKDF — باید با سمت سرور یکی باشد
+const HKDF_INFO_KEK: &[u8] = b"ghost/session-kek/v1";
+
+/// پیشوند AAD — باید با سمت سرور یکی باشد
+const AAD_PREFIX: &[u8] = b"ghost/session/v1";
+
+fn handshake_err(msg: &str) -> JsValue {
+    JsValue::from_str(msg)
+}
+
+#[wasm_bindgen]
+pub struct SessionHandshake {
+    secret: StaticSecret,
+    public: PublicKey,
+}
+
+#[wasm_bindgen]
+impl SessionHandshake {
+    /// ساخت keypair موقت X25519
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<SessionHandshake, JsValue> {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed)
+            .map_err(|e| handshake_err(&format!("RNG error: {e}")))?;
+
+        let secret = StaticSecret::from(seed);
+        let public = PublicKey::from(&secret);
+
+        Ok(SessionHandshake { secret, public })
+    }
+
+    /// کلید عمومی به base64 — همین رشته به `/session-init` می‌رود
+    pub fn public_key_b64(&self) -> String {
+        B64.encode(self.public.as_bytes())
+    }
+
+    /// باز کردن پاسخ سرور.
+    /// خروجی: JSON به شکل `{"hmac_key_hex":"...","aes_key_hex":"..."}`
+    pub fn complete(
+        &self,
+        server_pubkey_b64: &str,
+        salt_b64: &str,
+        wrapped_b64: &str,
+    ) -> Result<String, JsValue> {
+        // ── ۱. public key سرور ──────────────────────────────────
+        let server_pub_vec = B64
+            .decode(server_pubkey_b64.trim())
+            .map_err(|_| handshake_err("server_pubkey is not valid base64"))?;
+
+        if server_pub_vec.len() != 32 {
+            return Err(handshake_err("server_pubkey must be 32 bytes"));
+        }
+
+        let mut server_pub_arr = [0u8; 32];
+        server_pub_arr.copy_from_slice(&server_pub_vec);
+        let server_public = PublicKey::from(server_pub_arr);
+
+        // ── ۲. shared secret ───────────────────────────────────
+        let shared = self.secret.diffie_hellman(&server_public);
+        if !shared.was_contributory() {
+            return Err(handshake_err("invalid server public key (low order point)"));
+        }
+
+        // ── ۳. KEK با HKDF-SHA256 ──────────────────────────────
+        let salt = B64
+            .decode(salt_b64.trim())
+            .map_err(|_| handshake_err("salt is not valid base64"))?;
+
+        let hk = Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes());
+        let mut kek = [0u8; 32];
+        hk.expand(HKDF_INFO_KEK, &mut kek)
+            .map_err(|_| handshake_err("HKDF expand failed"))?;
+
+        // ── ۴. AES-256-GCM decrypt ─────────────────────────────
+        let wrapped = B64
+            .decode(wrapped_b64.trim())
+            .map_err(|_| handshake_err("wrapped is not valid base64"))?;
+
+        // nonce(12) || ciphertext+tag(16+)
+        if wrapped.len() < 12 + 16 {
+            return Err(handshake_err("wrapped payload is too short"));
+        }
+        let (nonce_bytes, ciphertext) = wrapped.split_at(12);
+
+        // AAD = "ghost/session/v1" || client_pub || server_pub
+        let mut aad = Vec::with_capacity(AAD_PREFIX.len() + 64);
+        aad.extend_from_slice(AAD_PREFIX);
+        aad.extend_from_slice(self.public.as_bytes());
+        aad.extend_from_slice(&server_pub_arr);
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&kek));
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(nonce_bytes),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| handshake_err("AES-GCM decryption failed — wrong key or tampered payload"))?;
+
+        // ── ۵. اعتبارسنجی محتوا ────────────────────────────────
+        let parsed: serde_json::Value = serde_json::from_slice(&plaintext)
+            .map_err(|_| handshake_err("decrypted payload is not valid JSON"))?;
+
+        let hmac_ok = parsed
+            .get("hmac_key_hex")
+            .and_then(|v| v.as_str())
+            .map(|v| v.len() >= 64)
+            .unwrap_or(false);
+        let aes_ok = parsed
+            .get("aes_key_hex")
+            .and_then(|v| v.as_str())
+            .map(|v| v.len() == 64)
+            .unwrap_or(false);
+
+        if !hmac_ok || !aes_ok {
+            return Err(handshake_err("decrypted payload is missing valid keys"));
+        }
+
+        String::from_utf8(plaintext)
+            .map_err(|_| handshake_err("decrypted payload is not valid UTF-8"))
+    }
 }
