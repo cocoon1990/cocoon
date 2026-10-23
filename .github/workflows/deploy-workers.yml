@@ -3,18 +3,14 @@
 #
 #  Builds streaming-worker و signaling-worker در Rust
 #  و آن‌ها را با Wrangler به Cloudflare Edge deploy می‌کند.
-#  فقط وقتی کد Worker تغییر کند اجرا می‌شود.
+#  فقط وقتی کد Worker یا خود این ورکفلو تغییر کند اجرا می‌شود.
 # ══════════════════════════════════════════════════════════════
 name: "⚙️ Build & Deploy — Rust Workers"
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "streaming-worker/**"
-      - "signaling-worker/**"
-
+  # ── اجرای دستی ────────────────────────────────────────────────
+  # اولین trigger در بلوک on — همیشه در دسترس است، حتی وقتی
+  # paths filter با هیچ تغییری match نشود.
   workflow_dispatch:
     inputs:
       worker:
@@ -26,6 +22,17 @@ on:
           - both
           - streaming
           - signaling
+
+  # ── اجرای خودکار روی main ─────────────────────────────────────
+  push:
+    branches:
+      - main
+    paths:
+      - "streaming-worker/**"
+      - "signaling-worker/**"
+      # تغییر در خودِ این ورکفلو هم باید اجرا را trigger کند،
+      # وگرنه اصلاحات CI هرگز خودشان تست نمی‌شوند.
+      - ".github/workflows/deploy-workers.yml"
 
 concurrency:
   group: "ghost-worker-deploy-${{ github.ref }}"
