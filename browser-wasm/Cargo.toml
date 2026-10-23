@@ -25,6 +25,16 @@ hex           = "0.4"
 # برای panic hook در browser
 console_error_panic_hook = "0.1"
 
+# ── تنظیمات wasm-opt (binaryen) ────────────────────────────────
+# Rust جدید (۱.۸x+) برای wasm32-unknown-unknown به صورت پیش‌فرض
+# bulk-memory را فعال می‌کند. نسخه‌ای که wasm-pack دانلود می‌کند
+# این قابلیت را پیش‌فرض روشن نمی‌کند و بیلد با این خطا می‌شکند:
+#   [wasm-validator error] Bulk memory operations require bulk memory
+#   Error: failed to execute `wasm-opt`
+# پس باید صریح فعال شود.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
 [profile.release]
 opt-level     = "z"
 lto           = "fat"
