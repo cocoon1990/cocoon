@@ -99,19 +99,61 @@ jobs:
         with:
           node-version: "20"
 
+      # ── worker-build (fast path) ───────────────────────────
+      # worker-build در رجیستری taiki-e/install-action وجود ندارد
+      # (آن action فقط ~۱۰۳ ابزار را می‌شناسد) و Cloudflare هم باینری
+      # prebuilt منتشر نمی‌کند. بنابراین سه لایه سرعت‌دهی:
+      #   ۱) کش باینری آماده با actions/cache  → اجراهای بعدی: چند ثانیه
+      #   ۲) cargo-binstall (باینری آماده از quickinstall، اگر موجود باشد)
+      #   ۳) cargo install  → فقط اولین اجرا / وقتی کش miss شود
+      - name: Cache worker-build binary
+        id: wb-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/worker-build
+          key: worker-build-${{ env.WORKER_BUILD_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-binstall (prebuilt, seconds)
+        if: steps.wb-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
       - name: Install worker-build ${{ env.WORKER_BUILD_VERSION }}
         run: |
-          # نسخه پین می‌شود تا با crate هم‌راستا بماند.
-          # نکته: worker-build نسخه را بدون پیشوند چاپ می‌کند (فقط "0.8.7")
-          # و بستهٔ منتشرشده Cargo.lock ندارد، پس --locked استفاده نمی‌شود.
-          cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}"
-          INSTALLED=$(worker-build --version | tr -d '[:space:]' | sed 's/^v//')
-          echo "worker-build installed: $INSTALLED"
-          if [ "$INSTALLED" != "${{ env.WORKER_BUILD_VERSION }}" ]; then
-            echo "❌ worker-build version mismatch: expected ${{ env.WORKER_BUILD_VERSION }}, got $INSTALLED"
+          VER="${{ env.WORKER_BUILD_VERSION }}"
+          BIN="$HOME/.cargo/bin/worker-build"
+
+          verify() {
+            [ -x "$BIN" ] || return 1
+            local v
+            v=$("$BIN" --version | tr -d '[:space:]' | sed 's/^v//')
+            [ "$v" = "$VER" ] || { echo "  found $v, want $VER"; return 1; }
+          }
+
+          if verify; then
+            echo "✅ worker-build $VER restored from cache ($( "$BIN" --version ))"
+            exit 0
+          fi
+
+          # ۲) باینری آماده — چند ثانیه (بدون کامپایل)
+          if command -v cargo-binstall >/dev/null 2>&1; then
+            echo "⬇️  trying cargo-binstall (prebuilt binary)..."
+            if cargo-binstall binstall --no-confirm --force "worker-build@${VER}" && verify; then
+              echo "✅ worker-build $VER installed from prebuilt binary"
+              exit 0
+            fi
+            echo "⚠️  cargo-binstall could not provide a prebuilt binary — falling back to source build"
+          fi
+
+          # ۳) ساخت از سورس — کند (~۴ دقیقه)، فقط وقتی لازم است
+          echo "🔨 building worker-build $VER from source..."
+          cargo install worker-build --version "$VER"
+          if ! verify; then
+            echo "❌ worker-build $VER not installed correctly"
             exit 1
           fi
-          echo "✅ worker-build $INSTALLED matches worker crate ${{ env.WORKER_BUILD_VERSION }}"
+          echo "✅ worker-build $VER built from source"
 
       # ── Build ──────────────────────────────────────────────
       - name: Build streaming-worker (Rust → Wasm)
@@ -175,18 +217,53 @@ jobs:
 
       # ── Health Check بعد از Deploy ─────────────────────────
       - name: Post-deploy health check
+        env:
+          HEALTH_URL: ${{ secrets.CF_STREAMING_URL }}
         run: |
-          echo "🔬 Waiting 5s for deployment propagation..."
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.CF_STREAMING_URL }}/health" \
-            --max-time 15)
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ Streaming Worker is healthy (HTTP 200)"
-          else
-            echo "❌ Health check failed (HTTP $STATUS)"
-            exit 1
+          # ── گارد: اگر secret تنظیم نشده باشد، اجرا نباید fail شود ──
+          # secret تنظیم‌نشده در GitHub Actions به رشتهٔ خالی تبدیل می‌شود؛
+          # مقدار placeholder هم معمولاً شامل '?' است.
+          if [ -z "${HEALTH_URL}" ] || printf '%s' "${HEALTH_URL}" | grep -q '?'; then
+            echo "::warning::CF_STREAMING_URL is not set. Skipping health check."
+            exit 0
           fi
+
+          URL="${HEALTH_URL%/}/health"
+          echo "🔬 Health check target: $URL"
+
+          # ── retry: تا ۳ تلاش با فاصلهٔ ۱۰ ثانیه ──
+          MAX_ATTEMPTS=3
+          RETRY_DELAY=10
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "── attempt $attempt/$MAX_ATTEMPTS ──"
+            # -s silent, -S show errors, --max-time 15, -w status code
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" --max-time 15 2>/tmp/curl_err) && CURL_RC=0 || CURL_RC=$?
+            STATUS="${STATUS:-000}"
+
+            if [ "$CURL_RC" -eq 0 ] && [ "$STATUS" = "200" ]; then
+              echo "✅ Streaming Worker is healthy (HTTP 200)"
+              exit 0
+            fi
+
+            if [ "$CURL_RC" -ne 0 ]; then
+              case "$CURL_RC" in
+                6)  echo "   curl exit 6: could not resolve host (DNS) — secret may point to a non-existent host" ;;
+                7)  echo "   curl exit 7: failed to connect" ;;
+                28) echo "   curl exit 28: timeout" ;;
+                *)  echo "   curl exit $CURL_RC: $(head -1 /tmp/curl_err 2>/dev/null || echo 'unknown error')" ;;
+              esac
+            else
+              echo "   HTTP $STATUS"
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "   retrying in ${RETRY_DELAY}s..."
+              sleep "$RETRY_DELAY"
+            fi
+          done
+
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)"
+          exit 1
 
   # ════════════════════════════════════════════════════════════
   #  Build و Deploy: Signaling Worker
@@ -232,10 +309,61 @@ jobs:
         with:
           node-version: "20"
 
+      # ── worker-build (fast path) ───────────────────────────
+      # worker-build در رجیستری taiki-e/install-action وجود ندارد
+      # (آن action فقط ~۱۰۳ ابزار را می‌شناسد) و Cloudflare هم باینری
+      # prebuilt منتشر نمی‌کند. بنابراین سه لایه سرعت‌دهی:
+      #   ۱) کش باینری آماده با actions/cache  → اجراهای بعدی: چند ثانیه
+      #   ۲) cargo-binstall (باینری آماده از quickinstall، اگر موجود باشد)
+      #   ۳) cargo install  → فقط اولین اجرا / وقتی کش miss شود
+      - name: Cache worker-build binary
+        id: wb-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/worker-build
+          key: worker-build-${{ env.WORKER_BUILD_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-binstall (prebuilt, seconds)
+        if: steps.wb-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
       - name: Install worker-build ${{ env.WORKER_BUILD_VERSION }}
         run: |
-          cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}"
-          echo "✅ worker-build: $(worker-build --version)"
+          VER="${{ env.WORKER_BUILD_VERSION }}"
+          BIN="$HOME/.cargo/bin/worker-build"
+
+          verify() {
+            [ -x "$BIN" ] || return 1
+            local v
+            v=$("$BIN" --version | tr -d '[:space:]' | sed 's/^v//')
+            [ "$v" = "$VER" ] || { echo "  found $v, want $VER"; return 1; }
+          }
+
+          if verify; then
+            echo "✅ worker-build $VER restored from cache ($( "$BIN" --version ))"
+            exit 0
+          fi
+
+          # ۲) باینری آماده — چند ثانیه (بدون کامپایل)
+          if command -v cargo-binstall >/dev/null 2>&1; then
+            echo "⬇️  trying cargo-binstall (prebuilt binary)..."
+            if cargo-binstall binstall --no-confirm --force "worker-build@${VER}" && verify; then
+              echo "✅ worker-build $VER installed from prebuilt binary"
+              exit 0
+            fi
+            echo "⚠️  cargo-binstall could not provide a prebuilt binary — falling back to source build"
+          fi
+
+          # ۳) ساخت از سورس — کند (~۴ دقیقه)، فقط وقتی لازم است
+          echo "🔨 building worker-build $VER from source..."
+          cargo install worker-build --version "$VER"
+          if ! verify; then
+            echo "❌ worker-build $VER not installed correctly"
+            exit 1
+          fi
+          echo "✅ worker-build $VER built from source"
 
       - name: Build signaling-worker (Rust → Wasm)
         working-directory: signaling-worker
@@ -294,17 +422,53 @@ jobs:
           GHOST_RELOAD_TOKEN: ${{ secrets.GHOST_RELOAD_TOKEN }}
 
       - name: Post-deploy health check
+        env:
+          HEALTH_URL: ${{ secrets.CF_SIGNALING_URL }}
         run: |
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.CF_SIGNALING_URL }}/health" \
-            --max-time 15)
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ Signaling Worker is healthy (HTTP 200)"
-          else
-            echo "❌ Health check failed (HTTP $STATUS)"
-            exit 1
+          # ── گارد: اگر secret تنظیم نشده باشد، اجرا نباید fail شود ──
+          # secret تنظیم‌نشده در GitHub Actions به رشتهٔ خالی تبدیل می‌شود؛
+          # مقدار placeholder هم معمولاً شامل '?' است.
+          if [ -z "${HEALTH_URL}" ] || printf '%s' "${HEALTH_URL}" | grep -q '?'; then
+            echo "::warning::CF_SIGNALING_URL is not set. Skipping health check."
+            exit 0
           fi
+
+          URL="${HEALTH_URL%/}/health"
+          echo "🔬 Health check target: $URL"
+
+          # ── retry: تا ۳ تلاش با فاصلهٔ ۱۰ ثانیه ──
+          MAX_ATTEMPTS=3
+          RETRY_DELAY=10
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "── attempt $attempt/$MAX_ATTEMPTS ──"
+            # -s silent, -S show errors, --max-time 15, -w status code
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" --max-time 15 2>/tmp/curl_err) && CURL_RC=0 || CURL_RC=$?
+            STATUS="${STATUS:-000}"
+
+            if [ "$CURL_RC" -eq 0 ] && [ "$STATUS" = "200" ]; then
+              echo "✅ Signaling Worker is healthy (HTTP 200)"
+              exit 0
+            fi
+
+            if [ "$CURL_RC" -ne 0 ]; then
+              case "$CURL_RC" in
+                6)  echo "   curl exit 6: could not resolve host (DNS) — secret may point to a non-existent host" ;;
+                7)  echo "   curl exit 7: failed to connect" ;;
+                28) echo "   curl exit 28: timeout" ;;
+                *)  echo "   curl exit $CURL_RC: $(head -1 /tmp/curl_err 2>/dev/null || echo 'unknown error')" ;;
+              esac
+            else
+              echo "   HTTP $STATUS"
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "   retrying in ${RETRY_DELAY}s..."
+              sleep "$RETRY_DELAY"
+            fi
+          done
+
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)"
+          exit 1
 
   # ════════════════════════════════════════════════════════════
   #  Summary Job
