@@ -1,11 +1,20 @@
-//! lib.rs — Streaming Worker با Rust (workers-rs)
+//! lib.rs — Streaming Worker (workers-rs 0.8.7)
 //!
 //! دو بخش اصلی:
 //!   1. SlidingWindowRateLimiter — Durable Object با SQLite
 //!   2. main Worker handler — routing + HMAC verify + stream pipe
+//!
+//! ── یادداشت مهاجرت به worker 0.8.7 ──────────────────────────────
+//! تغییرات API نسبت به 0.5 که در این فایل اعمال شده‌اند:
+//!   • `#[durable_object]` فقط روی **struct** می‌آید، نه روی impl block
+//!     (در 0.8.7 گذاشتن آن روی impl یک خطای کامپایل صریح است).
+//!   • امضای trait: `async fn fetch(&self, req: Request)` (قبلاً `&mut self`).
+//!   • SQLite: `sql.exec(query, bindings)` جای `exec()`/`exec_with()` را گرفته و
+//!     bindings از نوع `Vec<SqlStorageValue>` است (نه `&[JsValue]`).
+//!   • نتایج کوئری با `SqlCursor::to_array::<T>()` دیکد می‌شوند (typed).
 
-use worker::*;
 use serde::{Deserialize, Serialize};
+use worker::*;
 
 // ══════════════════════════════════════════════════════════════
 //  Durable Object: SlidingWindowRateLimiter
@@ -25,24 +34,39 @@ struct RateLimitResponse {
     retry_after_ms: Option<i64>,
 }
 
+/// ردیف نتیجهٔ `SELECT COUNT(*) AS cnt`
+#[derive(Deserialize)]
+struct CountRow {
+    cnt: i64,
+}
+
+/// ردیف نتیجهٔ `SELECT MIN(ts) AS oldest`
+#[derive(Deserialize)]
+struct OldestRow {
+    oldest: Option<i64>,
+}
+
+// در workers-rs 0.8.7 این attribute فقط روی struct قرار می‌گیرد.
+// قرار دادن آن روی `impl DurableObject for ...` خطای کامپایل می‌دهد:
+// "The #[durable_object] macro is no longer required for `impl` blocks"
 #[durable_object]
 pub struct SlidingWindowRateLimiter {
     state: State,
-    env: Env,
+    _env: Env,
 }
 
-#[durable_object]
 impl DurableObject for SlidingWindowRateLimiter {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self { state, _env: env }
     }
 
-    async fn fetch(&mut self, req: Request) -> Result<Response> {
+    // 0.8.7: `&self` (نه `&mut self`)
+    async fn fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
-        let params: std::collections::HashMap<String, String> =
-            url.query_pairs()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+        let params: std::collections::HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
 
         let limit: i64 = params
             .get("limit")
@@ -55,53 +79,48 @@ impl DurableObject for SlidingWindowRateLimiter {
             .unwrap_or(60_000);
 
         // ── SQLite در Durable Object ───────────────────────────
-        // ctx.storage.sql — GA از آوریل ۲۰۲۵
         // هر Durable Object instance یک SQLite database مستقل دارد
         let sql = self.state.storage().sql();
 
         // جدول یک بار ساخته می‌شود — idempotent
+        // 0.8.7: exec(query, bindings) — پارامتر دوم اجباری است (None = بدون binding)
         sql.exec(
             "CREATE TABLE IF NOT EXISTS hits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER NOT NULL
-            )"
+            )",
+            None,
         )?;
 
-        // Timestamp فعلی
-        // workers-rs از Date::now() استفاده می‌کند که UTC milliseconds برمی‌گرداند
+        // Timestamp فعلی — UTC milliseconds
         let now_ms = Date::now().as_millis() as i64;
         let cutoff = now_ms - window_ms;
 
         // ── Atomic Sliding Window ──────────────────────────────
-        // همه این عملیات‌ها در یک transaction اجرا می‌شوند
         // هیچ race condition امکان‌پذیر نیست چون Durable Object single-threaded است
 
         // ۱. پاکسازی hits قدیمی خارج از window
-        sql.exec_with(
+        sql.exec(
             "DELETE FROM hits WHERE ts < ?1",
-            &[wasm_bindgen::JsValue::from_f64(cutoff as f64)],
+            vec![SqlStorageValue::Integer(cutoff)],
         )?;
 
         // ۲. شمارش hits فعال در window فعلی
-        let result = sql.exec("SELECT COUNT(*) as cnt FROM hits")?;
-        let count: i64 = result
-            .results::<serde_json::Value>()
+        let count: i64 = sql
+            .exec("SELECT COUNT(*) as cnt FROM hits", None)?
+            .to_array::<CountRow>()
             .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|row| row["cnt"].as_i64())
+            .and_then(|rows| rows.first().map(|r| r.cnt))
             .unwrap_or(0);
 
         if count >= limit {
-            // Rate limit exceeded — مثل Valkey که SETNX شکست می‌خورد
+            // Rate limit exceeded
             // محاسبه زمان باقی‌مانده تا پاکسازی قدیمی‌ترین hit
-            let oldest_result = sql.exec(
-                "SELECT MIN(ts) as oldest FROM hits"
-            )?;
-            let oldest_ts: i64 = oldest_result
-                .results::<serde_json::Value>()
+            let oldest_ts: i64 = sql
+                .exec("SELECT MIN(ts) as oldest FROM hits", None)?
+                .to_array::<OldestRow>()
                 .ok()
-                .and_then(|rows| rows.into_iter().next())
-                .and_then(|row| row["oldest"].as_i64())
+                .and_then(|rows| rows.first().and_then(|r| r.oldest))
                 .unwrap_or(now_ms - window_ms);
 
             let retry_after_ms = (oldest_ts + window_ms) - now_ms;
@@ -122,14 +141,13 @@ impl DurableObject for SlidingWindowRateLimiter {
             headers.set("X-RateLimit-Remaining", "0")?;
             headers.set("Retry-After", &(retry_after_ms / 1000).to_string())?;
 
-            return Response::error(resp_body, 429)
-                .map(|r| r.with_headers(headers));
+            return Response::error(resp_body, 429).map(|r| r.with_headers(headers));
         }
 
         // ۳. ثبت hit جدید
-        sql.exec_with(
+        sql.exec(
             "INSERT INTO hits (ts) VALUES (?1)",
-            &[wasm_bindgen::JsValue::from_f64(now_ms as f64)],
+            vec![SqlStorageValue::Integer(now_ms)],
         )?;
 
         let remaining = limit - count - 1;
@@ -158,14 +176,12 @@ impl DurableObject for SlidingWindowRateLimiter {
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    // panic به جای crash بازگشت می‌دهد
-    utils::set_panic_hook();
-
     let router = Router::new();
     router
         .get_async("/stream", handle_stream)
         .get("/health", |_req, ctx| {
-            let version = ctx.var("WORKER_VERSION")
+            let version = ctx
+                .var("WORKER_VERSION")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             Response::ok(format!(
@@ -186,11 +202,12 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
 
     // ── ۲. بررسی Rate Limit از Durable Object ───────────────
     // یک instance به‌ازای هر IP = Sharding خودکار بر اساس IP
-    // مثل Valkey Cluster: هر key یک node مستقل
-    let rate_limit = ctx.var("RATE_LIMIT_RPM")
+    let rate_limit = ctx
+        .var("RATE_LIMIT_RPM")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "500".to_string());
-    let window_ms = ctx.var("RATE_WINDOW_MS")
+    let window_ms = ctx
+        .var("RATE_WINDOW_MS")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "60000".to_string());
 
@@ -233,7 +250,6 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         .clone();
 
     // ── ۴. HMAC Verification ────────────────────────────────
-    // پیام باید دقیقاً همان چیزی باشد که Browser Wasm امضا کرد
     let secret = ctx.secret("HMAC_SECRET")?.to_string();
     let message = format!("{}:{}", target_url, seq);
 
@@ -241,15 +257,12 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         return Response::error("Forbidden: Invalid HMAC signature", 403);
     }
 
-    // ── ۵. اعتبارسنجی URL مقصد ───────────────────────────────
-    // فقط googlevideo.com مجاز است — جلوگیری از SSRF
+    // ── ۵. اعتبارسنجی URL مقصد — جلوگیری از SSRF ────────────
     if !is_allowed_target(&target_url) {
         return Response::error("Forbidden: Target URL not allowed", 403);
     }
 
     // ── ۶. Streaming Pipe — صفر بایت Buffer در Worker ────────
-    // Worker فقط pipe می‌کند — هرگز body را buffer نمی‌کند
-    // CPU: ~0.5ms | Memory: ~0 | Bandwidth: رایگان (CF egress)
     let mut init = RequestInit::new();
     init.with_method(Method::Get);
 
@@ -264,7 +277,6 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     let upstream_req = Request::new_with_init(&target_url, &init)?;
     let upstream_resp = Fetch::Request(upstream_req).send().await?;
 
-    let status = upstream_resp.status_code();
     let upstream_headers_ref = upstream_resp.headers();
 
     // ساخت response headers
@@ -282,7 +294,6 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     }
 
     // بازگرداندن ReadableStream بدون buffer کردن
-    // این کلیدی‌ترین بخش است: Workers-rs upstream response را مستقیم pipe می‌کند
     Ok(upstream_resp.with_headers(resp_headers))
 }
 
@@ -329,11 +340,4 @@ fn is_allowed_target(url: &str) -> bool {
     allowed_hosts
         .iter()
         .any(|host| url_lower.contains(host))
-}
-
-mod utils {
-    pub fn set_panic_hook() {
-        #[cfg(feature = "console_error_panic_hook")]
-        console_error_panic_hook::set_once();
-    }
 }
