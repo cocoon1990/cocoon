@@ -521,44 +521,83 @@ function waitForActiveServiceWorker(registration) {
 }
 
 // ──────────────────────────────────────────────────────────────
-//  STEP 2: دریافت Session Keys از Signaling Worker
+//  STEP 2: تبادل کلید X25519 با Signaling Worker
+//
+//  هیچ secret خامی روی سیم نمی‌رود:
+//    ۱. keypair موقت X25519 در Wasm ساخته می‌شود (کلید خصوصی
+//       هرگز از مرورگر خارج نمی‌شود)
+//    ۲. فقط کلید عمومی به /session-init می‌رود
+//    ۳. worker با X25519+HKDF یک KEK می‌سازد و کلیدهای اصلی را
+//       با AES-256-GCM زیر آن رمز می‌کند
+//    ۴. همین‌جا در Wasm باز می‌شود
 // ──────────────────────────────────────────────────────────────
+
+let wasmModule = null;
+
+async function loadWasm() {
+  if (wasmModule) return wasmModule;
+  const mod = await import("./wasm/ghost_wasm.js");
+  await mod.default();          // wasm-pack --target web → init
+  wasmModule = mod;
+  return mod;
+}
+
 async function fetchSessionKeys() {
   try {
-    log("دریافت Session Keys از Signaling Worker...", "info");
+    log("تبادل کلید X25519 با Signaling Worker...", "info");
 
+    // ۱. keypair موقت در Wasm
+    const wasm = await loadWasm();
+    const handshake = new wasm.SessionHandshake();
+
+    // ۲. ارسال فقط کلید عمومی
     const resp = await fetch(`${SIGNALING_URL}/session-init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        client_pubkey: handshake.public_key_b64(),
         client_version: SW_VERSION,
-        timestamp: Date.now(),
       }),
     });
 
+    if (resp.status === 429) {
+      const info = await resp.json().catch(() => ({}));
+      throw new Error(
+        `محدودیت نرخ درخواست (429). ${info.retry_after_s || "چند"} ثانیه صبر کنید.`
+      );
+    }
+
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(`HTTP ${resp.status}: ${detail.message || resp.statusText}`);
     }
 
     const data = await resp.json();
 
-    // Signaling Worker باید این فیلدها را برگرداند
-    if (!data.hmac_key_hex || !data.aes_key_hex || !data.gas_endpoints) {
-      throw new Error("پاسخ ناقص از Signaling Worker: فیلدهای key یافت نشد.");
+    if (!data.server_pubkey || !data.salt || !data.wrapped) {
+      throw new Error("پاسخ ناقص از Signaling Worker: فیلدهای handshake یافت نشد.");
     }
+    if (data.protocol && data.protocol !== "x25519-hkdf-sha256-aesgcm-v1") {
+      throw new Error(`پروتکل ناشناخته: ${data.protocol}`);
+    }
+
+    // ۳. باز کردن payload رمزشده در Wasm
+    const keys = JSON.parse(
+      handshake.complete(data.server_pubkey, data.salt, data.wrapped)
+    );
 
     log(`Config version: ${data.config_version || "نامشخص"}`, "muted");
     configVersion = data.config_version || "—";
     $("metric-config-ver").textContent = configVersion;
 
     return {
-      hmacKeyHex:      data.hmac_key_hex,
-      aesKeyHex:       data.aes_key_hex,
-      gasEndpointsJson: JSON.stringify(data.gas_endpoints),
+      hmacKeyHex:      keys.hmac_key_hex,
+      aesKeyHex:       keys.aes_key_hex,
+      gasEndpointsJson: JSON.stringify(data.gas_endpoints || []),
     };
 
   } catch (err) {
-    log(`خطا در دریافت Session Keys: ${err.message}`, "error");
+    log(`خطا در تبادل کلید: ${err.message}`, "error");
     throw err;
   }
 }
