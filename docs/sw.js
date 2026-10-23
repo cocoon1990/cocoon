@@ -27,7 +27,7 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 const WASM_MODULE_PATH = "./wasm/ghost_wasm.js";
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.0.0";
+const SW_VERSION        = "5.1.2";   // 5.1.2: رفع race شرط WASM_READY / INIT_SESSION
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
@@ -35,6 +35,8 @@ const SW_VERSION        = "5.0.0";
 let wasmModule    = null;   // exports از ghost_wasm.js
 let session       = null;   // PhantomSession instance
 let routerReady   = false;  // آیا init_router() صدا زده شده؟
+let wasmReady     = false;  // آیا wasm import + ()default اجرا شده؟
+let initPromise   = null;   // init در جریان — جلوگیری از اجرای موازی
 
 // ──────────────────────────────────────────────────────────────
 //  Lifecycle: install
@@ -87,7 +89,8 @@ self.addEventListener("message", (event) => {
 
   switch (type) {
     case "INIT_SESSION":
-      handleInitSession(payload, event);
+      // waitUntil: بدون آن، مرورگر می‌تواند SW را وسط init خاموش کند
+      event.waitUntil(handleInitSession(payload, event));
       break;
 
     case "DESTROY":
@@ -99,9 +102,24 @@ self.addEventListener("message", (event) => {
       event.ports[0]?.postMessage(getStatus());
       break;
 
+    case "PING":
+      // بررسی فعال: main thread لازم نیست منتظر broadcast بماند.
+      // اگر Wasm/Config هنوز آماده نیست، همین‌جا init می‌شود.
+      event.waitUntil(
+        (async () => {
+          if (!wasmReady || !routerReady) {
+            await initializeGhostSystem().catch((err) =>
+              console.error("[Ghost SW] PING init failed:", err)
+            );
+          }
+          event.ports[0]?.postMessage(getStatus());
+        })()
+      );
+      break;
+
     case "RELOAD_CONFIG":
       // GitOps notify بعد از sync جدید
-      initializeGhostSystem().catch(console.error);
+      event.waitUntil(initializeGhostSystem({ force: true }).catch(console.error));
       break;
 
     default:
@@ -112,8 +130,13 @@ self.addEventListener("message", (event) => {
 // ──────────────────────────────────────────────────────────────
 //  Core: مقداردهی اولیه سیستم Ghost
 // ──────────────────────────────────────────────────────────────
-async function initializeGhostSystem() {
+async function initializeGhostSystem({ force } = {}) {
   try {
+    // idempotent: اگر前に conclu شده، اجرا دوباره نکن
+    if (!force && wasmModule && routerReady) {
+      return;
+    }
+
     console.log("[Ghost SW] Initializing Ghost system...");
 
     // ── Step 1: Import و Init Wasm Module ──────────────────
@@ -121,7 +144,11 @@ async function initializeGhostSystem() {
       const { default: init, ...exports } = await import(WASM_MODULE_PATH);
       await init(); // Wasm binary را لود می‌کند
       wasmModule = exports;
+      wasmReady = true;
       console.log("[Ghost SW] ✅ Wasm module loaded");
+
+      // broadcast WASM_READY به کل client هاست (UI Connect دکمه را فعال می‌کند)
+      notifyClients({ type: "WASM_READY", version: SW_VERSION });
     }
 
     // ── Step 2: دریافت Config از Signaling Worker ──────────
@@ -146,6 +173,7 @@ async function initializeGhostSystem() {
   } catch (err) {
     console.error("[Ghost SW] ❌ Initialization failed:", err);
     routerReady = false;
+    wasmReady = false;
   }
 }
 
@@ -296,29 +324,51 @@ async function handleStreamingRequest(request, decision) {
 //  Session Management
 // ──────────────────────────────────────────────────────────────
 async function handleInitSession(payload, event) {
-  try {
-    if (!wasmModule) {
-      throw new Error("Wasm module not loaded. Call INIT_SESSION after SW is ready.");
+  const MAX_RETRIES = 5;
+  const RETRY_MS = 500;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      if (!wasmModule) {
+        throw new Error("Wasm module not loaded. Call INIT_SESSION after SW is ready.");
+      }
+
+      const { hmacKeyHex, aesKeyHex, gasEndpointsJson } = payload;
+
+      // ساخت PhantomSession — کلیدها در Rust/Wasm با ZeroizeOnDrop مدیریت می‌شوند
+      session = new wasmModule.PhantomSession(
+        hmacKeyHex,
+        aesKeyHex,
+        STREAMING_WORKER_URL,
+        SIGNALING_WORKER_URL,
+        gasEndpointsJson
+      );
+
+      console.log("[Ghost SW] ✅ PhantomSession created");
+      event.ports[0]?.postMessage({ success: true });
+      return;
+
+    } catch (err) {
+      console.error(`[Ghost SW] Session init error (attempt ${attempt}/${MAX_RETRIES}):`, err);
+
+      // فقط در صورت loading되지 بودن wasm، تلاش مجدد کن
+      const isLoadError =
+        err.message && err.message.includes("Wasm module not loaded") && attempt < MAX_RETRIES;
+
+      if (!isLoadError) {
+        event.ports[0]?.postMessage({ success: false, error: err.message });
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
     }
-
-    const { hmacKeyHex, aesKeyHex, gasEndpointsJson } = payload;
-
-    // ساخت PhantomSession — کلیدها در Rust/Wasm با ZeroizeOnDrop مدیریت می‌شوند
-    session = new wasmModule.PhantomSession(
-      hmacKeyHex,
-      aesKeyHex,
-      STREAMING_WORKER_URL,
-      SIGNALING_WORKER_URL,
-      gasEndpointsJson
-    );
-
-    console.log("[Ghost SW] ✅ PhantomSession created");
-    event.ports[0]?.postMessage({ success: true });
-
-  } catch (err) {
-    console.error("[Ghost SW] Session init error:", err);
-    event.ports[0]?.postMessage({ success: false, error: err.message });
   }
+
+  // هر ۵ تلاش هم شکست خورد
+  event.ports[0]?.postMessage({
+    success: false,
+    error: "Wasm module still not loaded after retries — UI should wait for WASM_READY.",
+  });
 }
 
 function destroySession() {

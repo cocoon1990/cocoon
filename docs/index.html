@@ -428,6 +428,7 @@ const SW_VERSION    = "5.0.0";
 
 let swRegistration  = null;
 let configVersion   = "—";
+let wasmReady       = false;  // Wasm ماژول در Service Worker لود و آماده است؟
 
 // ── DOM References ─────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -465,6 +466,13 @@ function setBanner(icon, text, type) {
   banner.className = `connection-banner${type ? ` connection-banner--${type}` : ""}`;
 }
 
+// دکمه اتصال فقط فعال شود وقتی SW فعال و Wasm لود شده باشد
+function updateConnectButton() {
+  const btn = $("btn-connect");
+  if (!btn) return;
+  btn.disabled = !wasmReady || !swRegistration?.active;
+}
+
 // ──────────────────────────────────────────────────────────────
 //  STEP 1: ثبت Service Worker
 // ──────────────────────────────────────────────────────────────
@@ -492,6 +500,25 @@ async function registerServiceWorker() {
     log("Service Worker فعال است.", "ok");
     setDot("sw", "ok", "فعال");
     $("sw-version").textContent = `SW: v${SW_VERSION}`;
+
+    // اگر broadcasts قبل از ثبت listener ارسال شده باشد، وضعیت را مستقیماً چک کن
+    try {
+      const sw = swRegistration.active;
+      if (sw) {
+        const status = await new Promise((resolve) => {
+          const channel = new MessageChannel();
+          channel.port1.onmessage = (e) => resolve(e.data);
+          sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
+        });
+        if (status?.wasmLoaded) {
+          wasmReady = true;
+          setDot("wasm", "ok", "Wasm آماده");
+        }
+      }
+    } catch (_) {
+      // broadcast/PING بعداً własnie mismo تکمیل می‌کند
+    }
+    updateConnectButton();
 
   } catch (err) {
     log(`خطا در ثبت Service Worker: ${err.message}`, "error");
@@ -707,6 +734,60 @@ window.connectSession = async function () {
   try {
     // Keys دریافت و Session ساخته می‌شود
     const keys = await fetchSessionKeys();
+
+    // Race-fix: INIT_SESSION حتماً بعد از WASM_READY / GHOST_READY ارسال شود.
+    // دکمه Connect تا آن‌جا غیرفعال است، اما برای امنیت بیشتر دوباره چک می‌کنیم.
+    if (!wasmReady) {
+      log("در انتظار آمادگی Wasm در Service Worker...", "info");
+      const sw = swRegistration?.active;
+      if (!sw) {
+        throw new Error("Service Worker فعال نیست");
+      }
+
+      // PING: اگر SW هنوز init نشده، آن را راه‌اندازی می‌کند
+      const ping = new Promise((resolvePing) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => resolvePing();
+        sw.postMessage({ type: "PING" }, [channel.port2]);
+        setTimeout(resolvePing, 2000);
+      });
+
+      // منتظر broadcast WASM_READY / GHOST_READY بمانیم
+      const ready = new Promise((resolveReady) => {
+        const handler = (event) => {
+          const { type } = event.data || {};
+          if (type === "WASM_READY" || type === "GHOST_READY") {
+            navigator.serviceWorker.removeEventListener("message", handler);
+            resolveReady();
+          }
+        };
+        navigator.serviceWorker.addEventListener("message", handler);
+        setTimeout(resolveReady, 5000);
+      });
+
+      await Promise.race([ping, ready]).catch(() => {});
+      if (!wasmReady) {
+        // آخرین فرصت: اگر broadcast از دست رفت، وضعیت را مستقیماً بخوان
+        try {
+          const status = await new Promise((resolve) => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (e) => resolve(e.data);
+            sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
+          });
+          if (status?.wasmLoaded) {
+            wasmReady = true;
+            setDot("wasm", "ok", "Wasm آماده");
+            updateConnectButton();
+          }
+        } catch (_) {
+          // نادیده گرفته شود؛ خطای اصلی پایین‌تر ارسال می‌شود
+        }
+      }
+      if (!wasmReady) {
+        throw new Error("Wasm module در Service Worker آماده نشده است.");
+      }
+    }
+
     await sendInitSession(keys);
 
     log("PhantomSession با موفقیت ساخته شد.", "ok");
@@ -801,9 +882,18 @@ function stopStatsRefresh() {
 navigator.serviceWorker.addEventListener("message", (event) => {
   const { type, version } = event.data || {};
 
+  if (type === "WASM_READY") {
+    wasmReady = true;
+    log("Wasm ماژول در Service Worker لود شد.", "ok");
+    setDot("wasm", "ok", "Wasm آماده");
+    updateConnectButton();
+    return;
+  }
+
   if (type === "GHOST_READY") {
     log(`Service Worker آماده — v${version}`, "ok");
     setDot("wasm", "ok", "Router load شد");
+    updateConnectButton();
   }
 });
 
