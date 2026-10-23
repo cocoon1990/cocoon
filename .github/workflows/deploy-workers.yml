@@ -88,11 +88,33 @@ jobs:
           echo ""
           echo "📊 Wasm size: $(du -sh build/worker/*.wasm 2>/dev/null | awk '{print $1}' || echo 'N/A')"
 
+      # ── CRITICAL GUARD ─────────────────────────────────────
+      # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
+      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
+        working-directory: streaming-worker
+        run: |
+          echo "🔍 Verifying worker-build output (Rust → Wasm)..."
+          test -f build/worker/shim.mjs || {
+            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
+            exit 1
+          }
+          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
+          if [ "$WASM_COUNT" -lt 1 ]; then
+            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+            exit 1
+          fi
+          echo "✅ shim.mjs present"
+          find build/worker -name '*.wasm' -exec ls -lh {} \;
+          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+
       # ── Deploy ─────────────────────────────────────────────
       - name: Deploy streaming-worker to Cloudflare Edge
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy
           workingDirectory: streaming-worker
           secrets: |
             HMAC_SECRET
@@ -157,10 +179,32 @@ jobs:
           echo "📦 Build output:"
           ls -lh build/worker/
 
+      # ── CRITICAL GUARD ─────────────────────────────────────
+      # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
+      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
+        working-directory: signaling-worker
+        run: |
+          echo "🔍 Verifying worker-build output (Rust → Wasm)..."
+          test -f build/worker/shim.mjs || {
+            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
+            exit 1
+          }
+          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
+          if [ "$WASM_COUNT" -lt 1 ]; then
+            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+            exit 1
+          fi
+          echo "✅ shim.mjs present"
+          find build/worker -name '*.wasm' -exec ls -lh {} \;
+          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+
       - name: Deploy signaling-worker to Cloudflare Edge
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy
           workingDirectory: signaling-worker
           secrets: |
             HMAC_SECRET

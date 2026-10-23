@@ -24,6 +24,16 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             
             Ok(Response::ok(config)?.with_headers(headers))
         })
+        .post_async("/session-init", |mut _req, ctx| async move {
+            let hmac_secret = ctx.secret("HMAC_SECRET")?.to_string();
+            let resp = serde_json::json!({
+                "hmac_key_hex": hmac_secret,
+                "aes_key_hex": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff", 
+                "gas_endpoints": [], 
+                "config_version": "5.0.1"
+            });
+            Response::ok(resp.to_string())
+        })
         .post_async("/admin/reload-config", |mut req, _ctx| async move {
             // This endpoint is called by GitHub Actions to notify workers of config changes.
             // Since workers read config lazily from KV on each request, we just acknowledge.

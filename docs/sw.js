@@ -5,10 +5,12 @@
  *   ۱. Wasm module را import و init می‌کند
  *   ۲. Config را از Signaling Worker می‌خواند و Router را init می‌کند
  *   ۳. هر fetch event را intercept می‌کند
- *   ۴. با route_request() تصمیم می‌گیرد (Streaming vs Buffered vs Deny)
+ *   ۴. با route_request() تصمیم می‌گیرد (Streaming vs Deny)
  *   ۵. درخواست‌های Streaming را به CF Worker pipe می‌کند
- *   ۶. درخواست‌های Buffered را به GAS Pool می‌فرستد
- *   ۷. در beforeunload، PhantomSession را destroy می‌کند
+ *   ۶. در beforeunload، PhantomSession را destroy می‌کند
+ *
+ * توجه: GAS (Google Apps Script) به طور کامل از معماری حذف شده است.
+ * تمام ترافیک از مسیر Streaming می‌گذرد.
  *
  * این فایل یک ES Module Service Worker است.
  * ثبت آن در index.html با { type: 'module' } انجام می‌شود.
@@ -33,8 +35,6 @@ const SW_VERSION        = "5.0.0";
 let wasmModule    = null;   // exports از ghost_wasm.js
 let session       = null;   // PhantomSession instance
 let routerReady   = false;  // آیا init_router() صدا زده شده؟
-let gasEndpoints  = [];     // فهرست Apps Script endpoints (از Config)
-let gasRRIndex    = 0;      // Round-Robin counter (در سمت JS — backup)
 
 // ──────────────────────────────────────────────────────────────
 //  Lifecycle: install
@@ -137,17 +137,8 @@ async function initializeGhostSystem() {
       console.log("[Ghost SW] ✅ Declarative Router initialized");
     }
 
-    // ── Step 4: استخراج GAS endpoints از Config ───────────
-    const config = JSON.parse(configJson);
-    for (const rule of config.routing_rules || []) {
-      if (rule.action?.backend === "google_apps_script_pool") {
-        gasEndpoints = rule.action?.endpoints || [];
-        break;
-      }
-    }
-
     routerReady = true;
-    console.log(`[Ghost SW] ✅ System ready — ${gasEndpoints.length} GAS endpoints loaded`);
+    console.log("[Ghost SW] ✅ System ready — all traffic routed to streaming backend");
 
     // اطلاع به تمام client های باز
     notifyClients({ type: "GHOST_READY", version: SW_VERSION });
@@ -244,9 +235,6 @@ async function handleFetch(request) {
       case "cloudflare-stream-worker":
         return handleStreamingRequest(request, decision);
 
-      case "google-apps-script-pool":
-        return handleBufferedRequest(request, decision);
-
       case "cloudflare-signaling-worker":
         return fetch(request); // signaling را مستقیم می‌فرستیم
 
@@ -301,88 +289,6 @@ async function handleStreamingRequest(request, decision) {
   } catch (err) {
     console.error("[Ghost SW] Streaming error:", err);
     return new Response("Streaming Error", { status: 502 });
-  }
-}
-
-// ──────────────────────────────────────────────────────────────
-//  Buffered Path — API / HTML / JS / CSS → Google Apps Script
-// ──────────────────────────────────────────────────────────────
-async function handleBufferedRequest(request, decision) {
-  // Round-Robin endpoint انتخاب می‌شود
-  // Rust Router هم این کار را می‌کند اما اینجا JS backup داریم
-  let gasEndpoint = decision.selected_gas_endpoint;
-  if (!gasEndpoint && gasEndpoints.length > 0) {
-    gasEndpoint = gasEndpoints[gasRRIndex % gasEndpoints.length];
-    gasRRIndex++;
-  }
-
-  if (!gasEndpoint) {
-    console.error("[Ghost SW] No GAS endpoint available");
-    return new Response("No backend available", { status: 503 });
-  }
-
-  try {
-    // خواندن body برای POST requests
-    let bodyText = null;
-    if (request.method === "POST" || request.method === "PUT") {
-      bodyText = await request.text();
-    }
-
-    // رمزنگاری payload با AES-256-GCM توسط PhantomSession
-    const originalBody = bodyText || "";
-    const encryptedBody = session.encrypt_payload(
-      JSON.stringify({
-        url: request.url,
-        method: request.method,
-        body: originalBody,
-        headers: Object.fromEntries(request.headers.entries()),
-      })
-    );
-
-    // ارسال به Apps Script
-    const gasResp = await fetch(gasEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Ghost-Version": SW_VERSION,
-      },
-      body: JSON.stringify({
-        payload: encryptedBody,
-        timestamp: Date.now(),
-      }),
-    });
-
-    if (!gasResp.ok) {
-      throw new Error(`GAS returned HTTP ${gasResp.status}`);
-    }
-
-    const gasData = await gasResp.json();
-
-    // رمزگشایی پاسخ (Apps Script پاسخ را Base64 encode می‌کند)
-    const responseBody = gasData.body
-      ? atob(gasData.body)
-      : JSON.stringify(gasData);
-
-    return new Response(responseBody, {
-      status: gasData.status || 200,
-      headers: {
-        "Content-Type": gasData.contentType || "application/json",
-        "X-Ghost-Path": "buffered",
-        "X-Ghost-GAS-Endpoint": gasEndpoint.substring(0, 30) + "...",
-      },
-    });
-
-  } catch (err) {
-    console.error("[Ghost SW] Buffered request error:", err);
-
-    // Failover: امتحان endpoint بعدی
-    if (gasEndpoints.length > 1) {
-      console.log("[Ghost SW] Attempting failover to next GAS endpoint...");
-      gasRRIndex++; // endpoint بعدی
-      return handleBufferedRequest(request, decision);
-    }
-
-    return new Response("Backend Error", { status: 502 });
   }
 }
 
@@ -454,7 +360,6 @@ function getStatus() {
     version: SW_VERSION,
     routerReady,
     hasSession: session !== null,
-    gasEndpointsCount: gasEndpoints.length,
     wasmLoaded: wasmModule !== null,
     sessionStats: session ? session.stats() : null,
   };

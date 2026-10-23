@@ -54,7 +54,6 @@
                 "enum": [
                   "cloudflare_stream_worker",
                   "cloudflare_signaling_worker",
-                  "google_apps_script_pool",
                   "deny"
                 ]
               },
@@ -77,7 +76,7 @@
     },
     "rate_limits": {
       "type": "object",
-      "required": ["streaming_rpm", "buffered_rpm", "window_seconds"],
+      "required": ["streaming_rpm", "window_seconds"],
       "properties": {
         "streaming_rpm": { "type": "integer", "minimum": 1 },
         "buffered_rpm":  { "type": "integer", "minimum": 1 },

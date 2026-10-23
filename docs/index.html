@@ -353,11 +353,11 @@
         </div>
       </div>
       <div class="status-item">
-        <span class="status-dot" id="dot-gas"></span>
+        <span class="status-dot" id="dot-backend"></span>
         <div class="status-text">
-          <strong>GAS Endpoints</strong>
+          <strong>Backend</strong>
 
-          <span id="label-gas">ناشناخته</span>
+          <span id="label-backend">ناشناخته</span>
         </div>
       </div>
     </div>
@@ -373,7 +373,7 @@
       </div>
       <div class="metric">
         <div class="metric__value" id="metric-endpoints">—</div>
-        <div class="metric__label">GAS Endpoints</div>
+        <div class="metric__label">مسیر ترافیک</div>
       </div>
       <div class="metric">
         <div class="metric__value" id="metric-config-ver">—</div>
@@ -607,10 +607,9 @@ window.connectSession = async function () {
     setDot("session", "ok", "فعال");
     setDot("wasm", "ok", "Router آماده");
 
-    // GAS endpoints
-    const eps = JSON.parse(keys.gasEndpointsJson);
-    setDot("gas", "ok", `${eps.length} endpoint`);
-    $("metric-endpoints").textContent = eps.length;
+    // تمام ترافیک به Streaming Worker می‌رود (GAS حذف شده است)
+    setDot("backend", "ok", "streaming");
+    $("metric-endpoints").textContent = "stream";
 
     setBanner("🛡️", "متصل و ایمن", "connected");
     $("btn-destroy").disabled = false;
@@ -645,12 +644,11 @@ window.refreshStatus = async function () {
     sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
   });
 
-  log(`وضعیت: Router=${status.routerReady}, Session=${status.hasSession}, GAS=${status.gasEndpointsCount}`, "info");
+  log(`وضعیت: Router=${status.routerReady}, Session=${status.hasSession}, Wasm=${status.wasmLoaded}`, "info");
 
   if (status.sessionStats) {
     const stats = JSON.parse(status.sessionStats);
     $("metric-requests").textContent = stats.requests_made ?? "—";
-    $("metric-endpoints").textContent = stats.gas_endpoints ?? "—";
   }
 };
 

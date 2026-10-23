@@ -16,7 +16,6 @@ use wasm_bindgen::prelude::*;
 pub enum BackendType {
     CloudflareStreamWorker,
     CloudflareSignalingWorker,
-    GoogleAppsScriptPool,
     Deny,
 }
 
@@ -68,6 +67,7 @@ pub struct RoutingRule {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimits {
     pub streaming_rpm: u32,
+    #[serde(default)]
     pub buffered_rpm: u32,
     pub window_seconds: u32,
 }
@@ -97,8 +97,6 @@ pub struct RouteDecision {
     pub pipe_mode: Option<String>,
     /// timeout بر حسب میلی‌ثانیه
     pub timeout_ms: u64,
-    /// برای Apps Script Pool: endpoint انتخاب شده بر اساس round_robin
-    pub selected_gas_endpoint: Option<String>,
     /// آیا این درخواست باید رد شود؟
     pub is_denied: bool,
     /// پیام خطا اگر denied بود
@@ -111,7 +109,6 @@ pub struct RouteDecision {
 
 pub struct DeclarativeRouter {
     rules: Vec<RoutingRule>,
-    gas_round_robin_counter: std::cell::Cell<usize>,
 }
 
 impl DeclarativeRouter {
@@ -138,7 +135,6 @@ impl DeclarativeRouter {
 
         Ok(Self {
             rules: config.routing_rules,
-            gas_round_robin_counter: std::cell::Cell::new(0),
         })
     }
 
@@ -165,7 +161,6 @@ impl DeclarativeRouter {
             hmac_required: false,
             pipe_mode: None,
             timeout_ms: 0,
-            selected_gas_endpoint: None,
             is_denied: true,
             deny_message: Some("Internal: No rule matched.".to_string()),
         }
@@ -236,22 +231,6 @@ impl DeclarativeRouter {
     fn build_decision(&self, rule: &RoutingRule) -> RouteDecision {
         let is_denied = rule.action.backend == BackendType::Deny;
 
-        // برای Apps Script Pool: Round-Robin انتخاب endpoint
-        let selected_gas_endpoint = if rule.action.backend == BackendType::GoogleAppsScriptPool {
-            rule.action.endpoints.as_ref().and_then(|eps| {
-                if eps.is_empty() {
-                    return None;
-                }
-                // Atomic round-robin بدون race condition — single-threaded Wasm
-                let idx = self.gas_round_robin_counter.get();
-                let selected = eps[idx % eps.len()].clone();
-                self.gas_round_robin_counter.set(idx.wrapping_add(1));
-                Some(selected)
-            })
-        } else {
-            None
-        };
-
         RouteDecision {
             matched_rule: rule.name.clone(),
             backend: format!("{:?}", rule.action.backend)
@@ -261,7 +240,6 @@ impl DeclarativeRouter {
             hmac_required: rule.action.hmac_required,
             pipe_mode: rule.action.pipe_mode.clone(),
             timeout_ms: rule.action.timeout_ms,
-            selected_gas_endpoint,
             is_denied,
             deny_message: if is_denied {
                 rule.action.message.clone()
