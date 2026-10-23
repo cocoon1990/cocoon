@@ -1,18 +1,19 @@
 [package]
-name = "ghost-signaling-worker"
-version = "5.0.0"
-edition = "2021"
+name         = "ghost-signaling-worker"
+version      = "5.0.0"
+edition      = "2021"
+rust-version = "1.91"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = { version = "0.5", features = ["d1"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+worker      = { version = "0.8.7", features = ["d1"] }
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
 
 [profile.release]
-opt-level = "z"
-lto = "fat"
+opt-level     = "z"
+lto           = "fat"
 codegen-units = 1
-panic = "abort"
+panic         = "abort"

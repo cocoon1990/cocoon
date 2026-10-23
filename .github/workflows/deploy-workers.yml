@@ -34,6 +34,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # MSRV — worker 0.8.7 به Rust >= 1.91.0 نیاز دارد
+  RUST_MIN_VERSION: "1.91.0"
+  # worker-build باید هم‌نسخه با crate باشد
+  WORKER_BUILD_VERSION: "0.8.7"
 
 jobs:
   # ════════════════════════════════════════════════════════════
@@ -58,6 +62,23 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # ── MSRV Gate ──────────────────────────────────────────
+      # worker 0.8.7 به Rust >= 1.91.0 نیاز دارد. اگر toolchain
+      # قدیمی‌تر باشد، بیلد در ادامه با خطای گیج‌کننده شکست می‌خورد؛
+      # پس همین‌جا صریح fail می‌کنیم.
+      - name: "Guard: verify rustc >= ${{ env.RUST_MIN_VERSION }}"
+        run: |
+          rustc --version
+          ACTUAL=$(rustc --version | awk '{print $2}')
+          REQUIRED="${{ env.RUST_MIN_VERSION }}"
+          LOWEST=$(printf '%s\n%s\n' "$ACTUAL" "$REQUIRED" | sort -V | head -1)
+          if [ "$LOWEST" != "$REQUIRED" ]; then
+            echo "❌ rustc $ACTUAL is older than required $REQUIRED"
+            echo "   worker 0.8.7 requires rust-version = $REQUIRED"
+            exit 1
+          fi
+          echo "✅ rustc $ACTUAL >= $REQUIRED"
+
       # ── Cache ──────────────────────────────────────────────
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -71,10 +92,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install worker-build
+      - name: Install worker-build ${{ env.WORKER_BUILD_VERSION }}
         run: |
-          cargo install worker-build --locked
-          echo "✅ worker-build: $(worker-build --version)"
+          # نسخه پین می‌شود تا با crate هم‌راستا بماند.
+          # نکته: worker-build نسخه را بدون پیشوند چاپ می‌کند (فقط "0.8.7")
+          # و بستهٔ منتشرشده Cargo.lock ندارد، پس --locked استفاده نمی‌شود.
+          cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}"
+          INSTALLED=$(worker-build --version | tr -d '[:space:]' | sed 's/^v//')
+          echo "worker-build installed: $INSTALLED"
+          if [ "$INSTALLED" != "${{ env.WORKER_BUILD_VERSION }}" ]; then
+            echo "❌ worker-build version mismatch: expected ${{ env.WORKER_BUILD_VERSION }}, got $INSTALLED"
+            exit 1
+          fi
+          echo "✅ worker-build $INSTALLED matches worker crate ${{ env.WORKER_BUILD_VERSION }}"
 
       # ── Build ──────────────────────────────────────────────
       - name: Build streaming-worker (Rust → Wasm)
@@ -157,6 +187,18 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: "Guard: verify rustc >= ${{ env.RUST_MIN_VERSION }}"
+        run: |
+          rustc --version
+          ACTUAL=$(rustc --version | awk '{print $2}')
+          REQUIRED="${{ env.RUST_MIN_VERSION }}"
+          LOWEST=$(printf '%s\n%s\n' "$ACTUAL" "$REQUIRED" | sort -V | head -1)
+          if [ "$LOWEST" != "$REQUIRED" ]; then
+            echo "❌ rustc $ACTUAL is older than required $REQUIRED"
+            exit 1
+          fi
+          echo "✅ rustc $ACTUAL >= $REQUIRED"
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -168,8 +210,10 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install worker-build
-        run: cargo install worker-build --locked
+      - name: Install worker-build ${{ env.WORKER_BUILD_VERSION }}
+        run: |
+          cargo install worker-build --version "${{ env.WORKER_BUILD_VERSION }}"
+          echo "✅ worker-build: $(worker-build --version)"
 
       - name: Build signaling-worker (Rust → Wasm)
         working-directory: signaling-worker
