@@ -113,31 +113,46 @@ jobs:
           echo "🔨 Building streaming-worker in release mode..."
           worker-build --release
           echo ""
-          echo "📦 Build output:"
-          ls -lh build/worker/
+          echo "📦 Build output (build/ tree):"
+          find build -maxdepth 2 -type f | sort
           echo ""
-          echo "📊 Wasm size: $(du -sh build/worker/*.wasm 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+          echo "📊 Wasm artifact(s):"
+          find build -type f -name '*.wasm' -exec ls -lh {} \;
 
       # ── CRITICAL GUARD ─────────────────────────────────────
       # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
-      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
-      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده،
+      # فایل .wasm ساخته شده، و entrypoint اعلام‌شده در wrangler.toml موجود است.
       - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
         working-directory: streaming-worker
         run: |
           echo "🔍 Verifying worker-build output (Rust → Wasm)..."
-          test -f build/worker/shim.mjs || {
-            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
-            exit 1
-          }
-          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
-          if [ "$WASM_COUNT" -lt 1 ]; then
-            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+
+          # ── ۱) artifact .wasm — جست‌وجوی مستقل از layout زیر build/ ──
+          # توجه: worker-build 0.8.7 باینری را در build/<out_name>_bg.wasm
+          # می‌نویسد (یعنی build/index_bg.wasm) — نه داخل build/worker/.
+          # build/worker/shim.mjs فقط یک re-export به ../index.js است.
+          WASM_FILES=$(find build -type f -name '*.wasm')
+          if [ -z "$WASM_FILES" ]; then
+            echo "❌ No .wasm artifact found anywhere under build/"
+            echo "   Cloudflare only accepts WebAssembly — refusing to deploy raw Rust"
             exit 1
           fi
-          echo "✅ shim.mjs present"
-          find build/worker -name '*.wasm' -exec ls -lh {} \;
-          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+          echo "✅ Compiled Wasm artifact(s):"
+          for f in $WASM_FILES; do
+            ls -lh "$f"
+            [ -s "$f" ] || { echo "❌ Empty wasm file: $f"; exit 1; }
+          done
+
+          # ── ۲) entrypoint اعلام‌شده در wrangler.toml باید وجود داشته باشد ──
+          MAIN_PATH=$(python3 -c "import tomllib; print(tomllib.load(open('wrangler.toml','rb'))['main'])" 2>/dev/null \
+            || grep -m1 -E '^[[:space:]]*main[[:space:]]*=' wrangler.toml | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"[[:space:]]*$//')
+          echo "🔗 wrangler.toml main = ${MAIN_PATH}"
+          if [ ! -f "$MAIN_PATH" ]; then
+            echo "❌ wrangler.toml 'main' points to a missing file: ${MAIN_PATH}"
+            exit 1
+          fi
+          echo "✅ wrangler entrypoint present — ready for wrangler deploy"
 
       # ── Deploy ─────────────────────────────────────────────
       - name: Deploy streaming-worker to Cloudflare Edge
@@ -220,29 +235,43 @@ jobs:
         run: |
           echo "🔨 Building signaling-worker in release mode..."
           worker-build --release
-          echo "📦 Build output:"
-          ls -lh build/worker/
+          echo "📦 Build output (build/ tree):"
+          find build -maxdepth 2 -type f | sort
 
       # ── CRITICAL GUARD ─────────────────────────────────────
       # Cloudflare فقط WebAssembly می‌پذیرد — هرگز کد Rust خام.
-      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده
-      # و artifact های .wasm قبل از wrangler deploy وجود دارند.
+      # این step تضمین می‌کند worker-build --release واقعاً اجرا شده،
+      # فایل .wasm ساخته شده، و entrypoint اعلام‌شده در wrangler.toml موجود است.
       - name: "Guard: verify compiled Wasm artifacts (raw .rs is never uploaded)"
         working-directory: signaling-worker
         run: |
           echo "🔍 Verifying worker-build output (Rust → Wasm)..."
-          test -f build/worker/shim.mjs || {
-            echo "❌ build/worker/shim.mjs not found — worker-build --release did not run"
-            exit 1
-          }
-          WASM_COUNT=$(find build/worker -name '*.wasm' | wc -l)
-          if [ "$WASM_COUNT" -lt 1 ]; then
-            echo "❌ No .wasm artifact produced — refusing to deploy raw Rust to Cloudflare"
+
+          # ── ۱) artifact .wasm — جست‌وجوی مستقل از layout زیر build/ ──
+          # توجه: worker-build 0.8.7 باینری را در build/<out_name>_bg.wasm
+          # می‌نویسد (یعنی build/index_bg.wasm) — نه داخل build/worker/.
+          # build/worker/shim.mjs فقط یک re-export به ../index.js است.
+          WASM_FILES=$(find build -type f -name '*.wasm')
+          if [ -z "$WASM_FILES" ]; then
+            echo "❌ No .wasm artifact found anywhere under build/"
+            echo "   Cloudflare only accepts WebAssembly — refusing to deploy raw Rust"
             exit 1
           fi
-          echo "✅ shim.mjs present"
-          find build/worker -name '*.wasm' -exec ls -lh {} \;
-          echo "✅ ${WASM_COUNT} compiled Wasm artifact(s) ready for wrangler deploy"
+          echo "✅ Compiled Wasm artifact(s):"
+          for f in $WASM_FILES; do
+            ls -lh "$f"
+            [ -s "$f" ] || { echo "❌ Empty wasm file: $f"; exit 1; }
+          done
+
+          # ── ۲) entrypoint اعلام‌شده در wrangler.toml باید وجود داشته باشد ──
+          MAIN_PATH=$(python3 -c "import tomllib; print(tomllib.load(open('wrangler.toml','rb'))['main'])" 2>/dev/null \
+            || grep -m1 -E '^[[:space:]]*main[[:space:]]*=' wrangler.toml | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"[[:space:]]*$//')
+          echo "🔗 wrangler.toml main = ${MAIN_PATH}"
+          if [ ! -f "$MAIN_PATH" ]; then
+            echo "❌ wrangler.toml 'main' points to a missing file: ${MAIN_PATH}"
+            exit 1
+          fi
+          echo "✅ wrangler entrypoint present — ready for wrangler deploy"
 
       - name: Deploy signaling-worker to Cloudflare Edge
         uses: cloudflare/wrangler-action@v3
