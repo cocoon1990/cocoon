@@ -493,7 +493,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             if let Some(info) = check_rate_limit(&ctx, &client_ip, "session-init").await? {
                 let retry_secs = (info.retry_after_ms.unwrap_or(60_000) / 1000).max(1);
-                let mut headers = json_headers(origin.as_deref())?;
+                let headers = json_headers(origin.as_deref())?;
                 headers.set("Retry-After", &retry_secs.to_string())?;
                 headers.set("X-RateLimit-Limit", &info.limit.to_string())?;
                 headers.set("X-RateLimit-Remaining", "0")?;
@@ -639,7 +639,7 @@ const KNOWN_ENDPOINTS: [&str; 4] = [
 ];
 
 /// آخرین مرحلهٔ هر پاسخ: CORS تضمینی + بدنهٔ JSON برای 404/405.
-fn finalize(res: Response, origin: Option<&str>) -> Result<Response> {
+fn finalize(mut res: Response, origin: Option<&str>) -> Result<Response> {
     let status = res.status_code();
 
     // ── خطاهای مسیر/متد: بدنهٔ JSON قابل دیباگ ──────────────
