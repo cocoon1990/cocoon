@@ -124,25 +124,28 @@ jobs:
         if: failure()
         run: |
           set -u
-          ERR="$RUNNER_TEMP/rustc-errors.txt"
+          ERR="$RUNNER_TEMP/surfaced.txt"
           : > "$ERR"
 
-          for f in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/build.log"; do
-            [ -f "$f" ] || continue
-            # هر بلوک خطا: از خطی که با error شروع می‌شود، تا ۶۰ خط بعد
-            awk 'BEGIN{n=0} /^error(\[|:)/{hit=1} hit{print; n++; if(n>60) exit}' \
-              "$f" >> "$ERR"
-            echo "─────────" >> "$ERR"
-          done
+          for name in check.log build.log; do
+            f="$RUNNER_TEMP/$name"
+            echo "===== $name =====" >> "$ERR"
 
-          # اگر هیچ خط error پیدا نشد، ۴۰ خط آخر لاگ را نشان بده
-          if [ ! -s "$ERR" ]; then
-            for f in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/build.log"; do
-              [ -f "$f" ] || continue
-              echo "=== tail: $(basename "$f") ===" >> "$ERR"
-              tail -n 40 "$f" >> "$ERR"
-            done
-          fi
+            if [ ! -f "$f" ]; then
+              echo "(no log file was written)" >> "$ERR"
+              continue
+            fi
+
+            echo "size=$(wc -c < "$f") bytes, lines=$(wc -l < "$f")" >> "$ERR"
+
+            # --- بلوک‌های خطا (اگر وجود داشتند) ---
+            grep -a -n -E '^(error|warning: unused)' "$f" | head -n 20 >> "$ERR" || true
+
+            # --- همیشه ۴۰ خط آخر: تضمین می‌کند هیچ خطایی پنهان نماند ---
+            echo "--- last 40 lines ---" >> "$ERR"
+            tail -n 40 "$f" >> "$ERR"
+            echo "" >> "$ERR"
+          done
 
           # حداکثر ۶۰۰۰ کاراکتر (محدودیت annotation)
           head -c 6000 "$ERR" > "$RUNNER_TEMP/err-trim.txt"
@@ -154,18 +157,18 @@ jobs:
 
           echo "::error title=Rust build failed::$MSG"
 
-          echo "### ❌ browser-wasm build failed" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat "$RUNNER_TEMP/err-trim.txt" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### ❌ browser-wasm build failed" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          cat "$RUNNER_TEMP/err-trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Summary
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "### ✅ browser-wasm compiled successfully" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ✅ browser-wasm compiled successfully" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           else
-            echo "### ❌ browser-wasm build FAILED" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ❌ browser-wasm build FAILED" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "این ورک‌فلو deploy نمی‌کند — فقط کامپایل را بررسی می‌کند." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "این ورک‌فلو deploy نمی‌کند — فقط کامپایل را بررسی می‌کند." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
