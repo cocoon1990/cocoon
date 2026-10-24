@@ -115,8 +115,24 @@ jobs:
           npm install --silent --no-fund --no-audit --prefix desktop-app/.tools jsdom
           NODE_PATH="$PWD/desktop-app/.tools/node_modules" node desktop-app/tools/test_ui.cjs
 
+      # خروجی کامپایلر به‌صورت annotation منتشر می‌شود تا از API قابل خواندن
+      # باشد (لاگ خام روی storage خارجی است و در همه‌جا در دسترس نیست).
       - name: cargo check
-        run: cargo check --manifest-path desktop-app/src-tauri/Cargo.toml
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'cargo-check.log'
+          cargo check --manifest-path desktop-app/src-tauri/Cargo.toml --message-format=short 2>&1 |
+            Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $problems = Get-Content $log |
+              Where-Object { $_ -match 'error(\[E\d+\])?:|^error:|--> ' } |
+              Select-Object -First 40
+            foreach ($line in $problems) {
+              Write-Host ("::error::" + ($line -replace '%', '%25' -replace '\r', '' -replace '\n', ' '))
+            }
+            exit 1
+          }
 
   # ── ۲) ساخت ویندوز + انتشار ───────────────────────────────────
   build:
