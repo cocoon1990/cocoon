@@ -14,7 +14,7 @@ name: "🧹 Cleanup — temporary probe workers"
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "arena/ee9be859-cocoon"]
     paths: [".github/workflows/cleanup-workers.yml"]
 
 permissions:
