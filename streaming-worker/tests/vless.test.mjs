@@ -469,6 +469,7 @@ test('pin: entry.mjs هر دو موتور را می‌شناسد', () => {
   assert.match(entry, /from '\.\.\/build\/worker\/shim\.mjs'/);
   assert.match(entry, /from 'cloudflare:sockets'/);
   assert.match(entry, /createVlessHandler/);
+  assert.match(entry, /export const SlidingWindowRateLimiter/, 'the DO class must be exported by the entrypoint');
 });
 test('pin: wrangler به entry.mjs اشاره می‌کند', () => {
   assert.match(read('wrangler.toml'), /main\s*=\s*"src\/entry\.mjs"/);

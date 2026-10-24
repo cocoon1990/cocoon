@@ -23,6 +23,16 @@ import { createVlessHandler, isVlessPath } from './vless.js';
 /** worker-build گاهی default می‌دهد و گاهی namespace — هر دو را بپذیر. */
 const rustWorker = rustModule.default && rustModule.default.fetch ? rustModule.default : rustModule;
 
+/**
+ * کلاس Durable Object باید از **همین** entrypoint صادر شود.
+ * wrangler هنگام deploy این را اعتبارسنجی می‌کند و اگر نباشد کل دیپلوی
+ * رد می‌شود: «Your Worker depends on the following Durable Objects, which
+ * are not exported in your entrypoint file». کلاس در crate راست
+ * (`#[durable_object]`) تعریف شده و از shim صادر می‌شود؛ اینجا فقط
+ * دوباره صادرش می‌کنیم.
+ */
+export const SlidingWindowRateLimiter = rustModule.SlidingWindowRateLimiter;
+
 /** یک handler ساخته‌شده برای هر env (کش‌شده روی env object). */
 const cache = new WeakMap();
 
