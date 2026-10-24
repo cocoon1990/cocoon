@@ -191,8 +191,55 @@ impl DurableObject for SlidingWindowRateLimiter {
 //  Main Worker Handler
 // ══════════════════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════════════════
+//  CORS — باید روی *همهٔ* پاسخ‌های /stream باشد
+//
+//  چرا این حیاتی است: Service Worker صفحه را روی origin دیگری
+//  (github.io) اجرا می‌کند و درخواست به workers.dev یک درخواست
+//  cross-origin است. اگر پاسخ هدر ACAO نداشته باشد، مرورگر بدنه و
+//  status را به SW نمی‌دهد و fetch با TypeError: Failed to fetch
+//  reject می‌شود — دقیقاً همان خطای «خطای شبکه/CORS».
+//
+//  قبلاً فقط مسیر موفق ACAO داشت؛ پس هر 400/403/429 به‌صورت خطای
+//  شبکه‌ای مبهم دیده می‌شد و علت واقعی هرگز به UI نمی‌رسید.
+// ══════════════════════════════════════════════════════════════
+
+const CORS_EXPOSE: &str =
+    "X-Ghost-Worker, X-Ghost-Sub, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining";
+
+/// افزودن هدرهای CORS به یک پاسخ موجود (بدون دست‌زدن به بدنه)
+fn with_cors(mut res: Response) -> Response {
+    let headers = res.headers_mut();
+    let _ = headers.set("Access-Control-Allow-Origin", "*");
+    let _ = headers.set("Vary", "Origin");
+    let _ = headers.set("Access-Control-Expose-Headers", CORS_EXPOSE);
+    res
+}
+
+/// پاسخ خطای متنی + CORS — تا SW هرگز «Failed to fetch» نبیند
+fn cors_error(message: &str, status: u16) -> Result<Response> {
+    Ok(with_cors(Response::error(message, status)?))
+}
+
+/// preflight برای OPTIONS (Router خودش 405 می‌دهد، پس قبل از آن پاسخ می‌دهیم)
+fn cors_preflight() -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Access-Control-Allow-Origin", "*")?;
+    headers.set("Vary", "Origin")?;
+    headers.set("Access-Control-Allow-Methods", "GET, OPTIONS")?;
+    headers.set("Access-Control-Allow-Headers", "Range, Content-Type, Authorization")?;
+    headers.set("Access-Control-Expose-Headers", CORS_EXPOSE)?;
+    headers.set("Access-Control-Max-Age", "86400")?;
+    Ok(Response::empty()?.with_headers(headers).with_status(204))
+}
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // preflight سراسری — قبل از Router
+    if req.method() == Method::Options {
+        return cors_preflight();
+    }
+
     let router = Router::new();
     router
         .get_async("/stream", handle_stream)
@@ -211,15 +258,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
-async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    // ── ۱. استخراج IP client ────────────────────────────────
-    let client_ip = req
-        .headers()
-        .get("CF-Connecting-IP")?
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // ── ۲. بررسی Rate Limit از Durable Object ───────────────
-    // یک instance به‌ازای هر IP = Sharding خودکار بر اساس IP
+/// بررسی rate limit. خروجی `Some(resp)` فقط وقتی است که محدود شده‌ایم (429).
+/// هر خطای زیرساختی → `None` (fail-open) با لاگ، نه 500 بدون CORS.
+async fn check_rate_limit(ctx: &RouteContext<()>, client_ip: &str) -> Option<Response> {
     let rate_limit = ctx
         .var("RATE_LIMIT_RPM")
         .map(|v| v.to_string())
@@ -229,24 +270,72 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "60000".to_string());
 
-    let limiter_namespace = ctx.durable_object("RATE_LIMITER")?;
-    let limiter_id = limiter_namespace.id_from_name(&format!("stream:{}", client_ip))?;
-    let limiter_stub = limiter_id.get_stub()?;
+    let namespace = match ctx.durable_object("RATE_LIMITER") {
+        Ok(namespace) => namespace,
+        Err(err) => {
+            console_log!("[Ghost Streaming] RATE_LIMITER unavailable (fail-open): {:?}", err);
+            return None;
+        }
+    };
+
+    let id = match namespace.id_from_name(&format!("stream:{}", client_ip)) {
+        Ok(id) => id,
+        Err(err) => {
+            console_log!("[Ghost Streaming] limiter id failed (fail-open): {:?}", err);
+            return None;
+        }
+    };
+
+    let stub = match id.get_stub() {
+        Ok(stub) => stub,
+        Err(err) => {
+            console_log!("[Ghost Streaming] limiter stub failed (fail-open): {:?}", err);
+            return None;
+        }
+    };
 
     let check_url = format!(
         "http://internal/check?limit={}&window_ms={}",
         rate_limit, window_ms
     );
-    let limit_req = Request::new(&check_url, Method::Get)?;
-    let limit_resp = limiter_stub.fetch_with_request(limit_req).await?;
+    let request = match Request::new(&check_url, Method::Get) {
+        Ok(request) => request,
+        Err(err) => {
+            console_log!("[Ghost Streaming] limiter request failed (fail-open): {:?}", err);
+            return None;
+        }
+    };
 
-    if limit_resp.status_code() == 429 {
-        // Rate limit — headers را از DO منتقل می‌کنیم
-        return Ok(limit_resp);
+    match stub.fetch_with_request(request).await {
+        Ok(resp) if resp.status_code() == 429 => Some(resp),
+        Ok(_) => None,
+        Err(err) => {
+            console_log!("[Ghost Streaming] limiter fetch failed (fail-open): {:?}", err);
+            None
+        }
+    }
+}
+
+async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    // ── ۱. استخراج IP client ────────────────────────────────
+    let client_ip = req
+        .headers()
+        .get("CF-Connecting-IP")?
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // ── ۲. بررسی Rate Limit از Durable Object ───────────────
+    // خطای DO نباید کل streaming را از کار بیندازد (fail-open) ولی
+    // نباید بی‌صدا هم باشد. گیت HMAC همچنان پابرجاست.
+    if let Some(resp) = check_rate_limit(&ctx, &client_ip).await {
+        // 429 — هدرهای DO حفظ می‌شوند و CORS هم اضافه می‌شود
+        return Ok(with_cors(resp));
     }
 
     // ── ۳. خواندن و validate کردن query params ──────────────
-    let url = req.url()?;
+    let url = match req.url() {
+        Ok(url) => url,
+        Err(_) => return cors_error("Bad Request: malformed request URL", 400),
+    };
     let params: std::collections::HashMap<String, String> = url
         .query_pairs()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -260,7 +349,7 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     let seq = params.get("seq").cloned();
 
     let (Some(target_url), Some(sig), Some(seq)) = (target_url, sig, seq) else {
-        return Response::error(
+        return cors_error(
             "Bad Request: 'target', 'sig' and 'seq' query parameters are required",
             400,
         );
@@ -268,26 +357,35 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
 
     // اعتبارسنجی شکل ورودی قبل از هر کار رمزنگاری
     if seq.parse::<u64>().is_err() {
-        return Response::error("Bad Request: 'seq' must be an unsigned integer", 400);
+        return cors_error("Bad Request: 'seq' must be an unsigned integer", 400);
     }
     if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Response::error(
+        return cors_error(
             "Bad Request: 'sig' must be a 64-character hex HMAC-SHA256 digest",
             400,
         );
     }
 
     // ── ۴. HMAC Verification ────────────────────────────────
-    let secret = ctx.secret("HMAC_SECRET")?.to_string();
+    let secret = match ctx.secret("HMAC_SECRET") {
+        Ok(secret) => secret.to_string(),
+        Err(_) => {
+            console_log!("[Ghost Streaming] HMAC_SECRET is not configured");
+            return cors_error("Server Error: HMAC_SECRET is not configured", 500);
+        }
+    };
     let message = format!("{}:{}", target_url, seq);
 
     if !verify_hmac_signature(&message, &sig, &secret) {
-        return Response::error("Forbidden: Invalid HMAC signature", 403);
+        return cors_error("Forbidden: Invalid HMAC signature", 403);
     }
 
     // ── ۵. اعتبارسنجی URL مقصد — جلوگیری از SSRF ────────────
     if !is_allowed_target(&target_url) {
-        return Response::error("Forbidden: Target URL not allowed", 403);
+        return cors_error(
+            "Forbidden: Target URL not allowed. /stream only proxies allowlisted hosts (YouTube/Google CDN).",
+            403,
+        );
     }
 
     // ── ۶. Streaming Pipe — صفر بایت Buffer در Worker ────────
@@ -302,8 +400,20 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     upstream_headers.set("User-Agent", "Mozilla/5.0 (compatible; GhostProxy/5.0)")?;
     init.with_headers(upstream_headers);
 
-    let upstream_req = Request::new_with_init(&target_url, &init)?;
-    let upstream_resp = Fetch::Request(upstream_req).send().await?;
+    let upstream_req = match Request::new_with_init(&target_url, &init) {
+        Ok(request) => request,
+        Err(err) => {
+            console_log!("[Ghost Streaming] upstream request build failed: {:?}", err);
+            return cors_error("Bad Gateway: upstream request could not be constructed", 502);
+        }
+    };
+    let upstream_resp = match Fetch::Request(upstream_req).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            console_log!("[Ghost Streaming] upstream fetch failed: {:?}", err);
+            return cors_error("Bad Gateway: upstream fetch failed", 502);
+        }
+    };
 
     let upstream_headers_ref = upstream_resp.headers();
 
@@ -320,9 +430,17 @@ async fn handle_stream(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     if let Ok(Some(cr)) = upstream_headers_ref.get("Content-Range") {
         resp_headers.set("Content-Range", &cr)?;
     }
+    // Content-Encoding/Content-Length هم باید منتقل شوند، وگرنه بدنهٔ
+    // gzip بدون هدر می‌رسد و کلاینت آن را خراب می‌بیند.
+    if let Ok(Some(ce)) = upstream_headers_ref.get("Content-Encoding") {
+        resp_headers.set("Content-Encoding", &ce)?;
+    }
+    if let Ok(Some(cl)) = upstream_headers_ref.get("Content-Length") {
+        resp_headers.set("Content-Length", &cl)?;
+    }
 
-    // بازگرداندن ReadableStream بدون buffer کردن
-    Ok(upstream_resp.with_headers(resp_headers))
+    // بازگرداندن ReadableStream بدون buffer کردن (+ CORS)
+    Ok(with_cors(upstream_resp.with_headers(resp_headers)))
 }
 
 /// HMAC-SHA256 Verification — constant-time برای جلوگیری از timing attack

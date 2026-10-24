@@ -6,7 +6,7 @@
   <title>SCP-GHOST — Phantom Citadel</title>
 
   <!--
-    docs/index.html — SCP-GHOST v5.2.0 UI
+    docs/index.html — SCP-GHOST v5.2.1 UI
     این صفحه:
       ۱. Service Worker را ثبت می‌کند
       ۲. Session keys را از Signaling Worker می‌خواند
@@ -363,7 +363,7 @@
   <!-- ── Header ─────────────────────────────────────────── -->
   <header class="header">
     <div class="header__logo">SCP-GHOST</div>
-    <div class="header__subtitle">Operation Phantom Citadel — v5.2.0</div>
+    <div class="header__subtitle">Operation Phantom Citadel — v5.2.1</div>
     <span class="header__version" id="sw-version">SW: loading...</span>
   </header>
 
@@ -469,7 +469,7 @@
         spellcheck="false"
         autocomplete="off"
         aria-label="Tunnel test URL"
-        value="https://api.ipify.org?format=json"
+        value="https://www.youtube.com/robots.txt"
       />
       <button class="btn btn--primary" id="btn-tunnel-test" onclick="runTunnelTest()">
         🧪 Fetch via Tunnel
@@ -477,7 +477,7 @@
     </div>
 
     <div class="tunnel-test__meta" id="tunnel-test-meta">
-      آماده — دکمه را بزنید.
+      آماده — مقصد باید در allowlist باشد (YouTube / Google CDN).
     </div>
 
     <pre class="tunnel-test__out" id="tunnel-test-output" dir="ltr">—</pre>
@@ -487,7 +487,7 @@
 
 <!-- ── Footer ───────────────────────────────────────────── -->
 <footer class="footer">
-  SCP-GHOST v5.2.0 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
+  SCP-GHOST v5.2.1 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
 </footer>
 
 <script type="module">
@@ -503,7 +503,7 @@
 
 // این مقدار توسط deploy-pages.yml inject می‌شود
 const SIGNALING_URL = "__CF_SIGNALING_URL__";
-const SW_VERSION    = "5.2.0";
+const SW_VERSION    = "5.2.1";
 
 let swRegistration  = null;
 let configVersion   = "—";
@@ -1140,7 +1140,9 @@ window.addEventListener("beforeunload", () => {
 //      session هر دو آماده باشند؛ وگرنه fetch(request) = pass-through.
 //    • پس وضعیت خودِ SW منبع حقیقت است، نه status code پاسخ.
 // ──────────────────────────────────────────────────────────────
-const TUNNEL_TEST_DEFAULT = "https://api.ipify.org?format=json";
+// مقصد پیش‌فرض باید در allowlist ورکر باشد، وگرنه تست هرگز سبز نمی‌شود.
+// api.ipify.org عمداً در allowlist نیست (جلوگیری از تبدیل worker به open proxy).
+const TUNNEL_TEST_DEFAULT = "https://www.youtube.com/robots.txt";
 
 function setTunnelTestOutput(text) {
   const out = $("tunnel-test-output");
@@ -1211,8 +1213,16 @@ window.runTunnelTest = async function () {
     const body = await resp.text();
     setTunnelTestOutput(body || "(پاسخ خالی)");
 
-    const viaStreaming = (resp.headers.get("X-Ghost-Path") || "").toLowerCase() === "streaming";
-    const swStreamingError = body.trim() === "Streaming Error";
+    // قرارداد sw.js: streaming | streaming-error | network-error |
+    // passthrough-error | routing-error | sign-error | denied
+    const ghostPath = (resp.headers.get("X-Ghost-Path") || "").toLowerCase();
+    const viaStreaming = ghostPath === "streaming";
+    const swWorkerError = ghostPath === "streaming-error";
+    const swLocalError =
+      ghostPath === "network-error" ||
+      ghostPath === "passthrough-error" ||
+      ghostPath === "routing-error" ||
+      ghostPath === "sign-error";
 
     // اگر پاسخ JSON با فیلد ip بود، IP خروجی را نشان بده
     let egressIp = null;
@@ -1226,7 +1236,7 @@ window.runTunnelTest = async function () {
     const detail =
       `HTTP ${resp.status}` +
       ` · router=${status.routerReady}, session=${status.hasSession}` +
-      ` · path=${viaStreaming ? "streaming" : "pass-through"}` +
+      ` · path=${ghostPath || "none (pass-through)"}` +
       (egressIp ? ` · IP خروجی: ${egressIp}` : "");
 
     // ✅ فقط وقتی که واقعاً از مسیر streaming-worker برگشته باشد
@@ -1237,12 +1247,20 @@ window.runTunnelTest = async function () {
       return true;
     }
 
-    // 502 + بدنهٔ «Streaming Error» یعنی: SW intercept کرد، worker رد کرد
-    if (swStreamingError) {
+    // SW پیام واقعی worker را برگردانده است (403/429/502/…)
+    if (swWorkerError) {
       reportTunnelFailure(
-        `درخواست intercept و به streaming-worker فرستاده شد، اما worker آن را رد کرد (${resp.status}). ` +
-          `مقصد باید در allowlist باشد؛ مثلاً https://www.youtube.com/robots.txt را امتحان کنید.`
+        `درخواست intercept شد و به streaming-worker رفت، اما worker آن را رد کرد — ` +
+          `${body.trim().slice(0, 300)}`
       );
+      log(`جزئیات: ${detail}`, "muted");
+      log("مقصد باید در allowlist باشد؛ مثلاً https://www.youtube.com/robots.txt را امتحان کنید.", "muted");
+      return false;
+    }
+
+    // خطای محلی SW (شبکه/CORS، pass-through، routing، امضا)
+    if (swLocalError) {
+      reportTunnelFailure(`Service Worker: ${body.trim().slice(0, 300)}`);
       log(`جزئیات: ${detail}`, "muted");
       return false;
     }
