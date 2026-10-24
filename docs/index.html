@@ -6,7 +6,7 @@
   <title>SCP-GHOST — Phantom Citadel</title>
 
   <!--
-    docs/index.html — SCP-GHOST v5.2.1 UI
+    docs/index.html — SCP-GHOST v5.2.2 UI
     این صفحه:
       ۱. Service Worker را ثبت می‌کند
       ۲. Session keys را از Signaling Worker می‌خواند
@@ -363,7 +363,7 @@
   <!-- ── Header ─────────────────────────────────────────── -->
   <header class="header">
     <div class="header__logo">SCP-GHOST</div>
-    <div class="header__subtitle">Operation Phantom Citadel — v5.2.1</div>
+    <div class="header__subtitle">Operation Phantom Citadel — v5.2.2</div>
     <span class="header__version" id="sw-version">SW: loading...</span>
   </header>
 
@@ -487,7 +487,7 @@
 
 <!-- ── Footer ───────────────────────────────────────────── -->
 <footer class="footer">
-  SCP-GHOST v5.2.1 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
+  SCP-GHOST v5.2.2 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
 </footer>
 
 <script type="module">
@@ -503,7 +503,7 @@
 
 // این مقدار توسط deploy-pages.yml inject می‌شود
 const SIGNALING_URL = "__CF_SIGNALING_URL__";
-const SW_VERSION    = "5.2.1";
+const SW_VERSION    = "5.2.2";
 
 let swRegistration  = null;
 let configVersion   = "—";
@@ -768,7 +768,7 @@ let wasmModule = null;
 
 async function loadWasm() {
   if (wasmModule) return wasmModule;
-  const mod = await import("./wasm/ghost_wasm.js");
+  const mod = await import("./wasm/ghost_wasm.js?v=5.2.2");
   await mod.default();          // wasm-pack --target web → init
   wasmModule = mod;
   return mod;
