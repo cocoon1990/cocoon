@@ -23,9 +23,27 @@ id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 
 # ── Secrets (inject شده توسط wrangler یا GitHub Actions) ─────
 # HMAC_SECRET — با `wrangler secret put HMAC_SECRET` تنظیم می‌شود
+#
+# ── /sub (اشتراک VLESS) ────────────────────────────────────────
+# این worker سرور VLESS نیست؛ /sub فقط یک لینک استاندارد می‌سازد
+# که به یک سرور VLESS واقعی اشاره می‌کند. تا وقتی مقادیر زیر تنظیم
+# نشوند، /sub عمداً 503 می‌دهد (fail-closed) تا کلاینت لینک مرده
+# import نکند.
+#
+#   wrangler secret put SUB_TOKEN     # >= 24 کاراکتر، تصادفی
+#   wrangler secret put VLESS_UUID    # UUID کلاینت روی سرور VLESS
+#   wrangler secret put VLESS_HOST    # دامنهٔ سرور VLESS، بدون scheme
+#
+# اختیاری (با `wrangler secret put` یا در [vars] زیر):
+#   VLESS_PATH   = "/vless"    مسیر WebSocket
+#   VLESS_SNI    = VLESS_HOST  پیش‌فرض
+#   VLESS_REMARK = "SCP-GHOST" نام نمایشی نود
+#
+# ساخت توکن تصادفی:
+#   openssl rand -hex 32
 
 [vars]
-WORKER_VERSION   = "5.0.0"
+WORKER_VERSION   = "5.2.0"
 CONFIG_KV_KEY    = "routing_config"
 RATE_LIMIT_RPM   = "500"
 RATE_WINDOW_MS   = "60000"

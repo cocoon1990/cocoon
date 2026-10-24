@@ -29,6 +29,21 @@ permissions:
   contents: read   # فقط خواندن — این ورک‌فلو deploy نمی‌کند
 
 jobs:
+  # ── تست منطق خالص ─────────────────────────────────────────────
+  # allowlist مقصد (ضد SSRF) و ساخت URI اشتراک، تابع‌های خالص Rust‌اند
+  # اما cargo test روی wasm32 اجرا نمی‌شود. این job یک پورت خط‌به‌خط
+  # از همان الگوریتم را روی boundary caseها تست می‌کند.
+  logic:
+    name: "🐍 Logic mirror test (SSRF allowlist + VLESS URI)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run mirror test
+        run: python3 scripts/test_streaming_logic.py
+
   check:
     name: "🦀 cargo check — ${{ matrix.worker }}"
     runs-on: ubuntu-latest
