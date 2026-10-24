@@ -27,7 +27,7 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 const WASM_MODULE_PATH = "./wasm/ghost_wasm.js";
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.1.2";   // 5.1.2: رفع race شرط WASM_READY / INIT_SESSION
+const SW_VERSION        = "5.1.3";   // 5.1.3: broadcast قابل اعتماد + خطاهای صریح Wasm
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
@@ -54,11 +54,20 @@ self.addEventListener("activate", (event) => {
   console.log(`[Ghost SW ${SW_VERSION}] Activating...`);
   event.waitUntil(
     (async () => {
-      // کنترل تمام client های باز را فوری بگیر
+      // ابتدا کنترل تمام client های باز را بگیر تا broadcast گم نشود.
       await self.clients.claim();
-      // Wasm را بارگذاری و Router را init کن
+
+      // initializeGhostSystem خطاها را داخل خودش log و broadcast می‌کند.
+      // fetchRoutingConfig هم timeout دارد تا activate بی‌نهایت معطل نماند.
       await initializeGhostSystem();
-    })()
+    })().catch((err) => {
+      console.error("[Ghost SW] ❌ Activation failed:", err);
+      return notifyClients({
+        type: "WASM_FAILED",
+        version: SW_VERSION,
+        error: err?.message || String(err),
+      });
+    })
   );
 });
 
@@ -104,27 +113,38 @@ self.addEventListener("message", (event) => {
 
     case "PING":
       // بررسی فعال: main thread لازم نیست منتظر broadcast بماند.
-      // اگر Wasm/Config هنوز آماده نیست، همین‌جا init می‌شود.
+      // initPromise جلوی اجرای موازی activate و PING را می‌گیرد.
       event.waitUntil(
         (async () => {
-          if (!wasmReady || !routerReady) {
-            await initializeGhostSystem().catch((err) =>
-              console.error("[Ghost SW] PING init failed:", err)
-            );
+          try {
+            if (!wasmReady || !routerReady) {
+              await initializeGhostSystem();
+            }
+
+            // کلاینتی ممکن است پیام اولیه را از دست داده باشد؛ اگر Wasm آماده
+            // است، WASM_READY را دوباره broadcast کن تا دکمه Connect آزاد شود.
+            if (wasmReady) {
+              await notifyClients({ type: "WASM_READY", version: SW_VERSION });
+            }
+            event.ports[0]?.postMessage(getStatus());
+          } catch (err) {
+            console.error("[Ghost SW] ❌ PING init failed:", err);
+            event.ports[0]?.postMessage({
+              ...getStatus(),
+              error: err?.message || String(err),
+            });
           }
-          // اگر Wasm قبلاً لود شده است، WASM_READY را دوباره broadcast کنیم
-          // برای کلاینت‌هایی که ممکن است پیام اولیه را از دست داده باشند
-          if (wasmReady) {
-            notifyClients({ type: "WASM_READY", version: SW_VERSION });
-          }
-          event.ports[0]?.postMessage(getStatus());
         })()
       );
       break;
 
     case "RELOAD_CONFIG":
       // GitOps notify بعد از sync جدید
-      event.waitUntil(initializeGhostSystem({ force: true }).catch(console.error));
+      event.waitUntil(
+        initializeGhostSystem({ force: true }).catch((err) => {
+          console.error("[Ghost SW] ❌ Config reload failed:", err);
+        })
+      );
       break;
 
     default:
@@ -135,57 +155,110 @@ self.addEventListener("message", (event) => {
 // ──────────────────────────────────────────────────────────────
 //  Core: مقداردهی اولیه سیستم Ghost
 // ──────────────────────────────────────────────────────────────
-async function initializeGhostSystem({ force } = {}) {
-  try {
-    // ایدپوتنت: اگر قبلاً انجام شده، اجرا دوباره نکن
-    if (!force && wasmModule && routerReady) {
-      return;
-    }
+async function initializeGhostSystem({ force = false } = {}) {
+  // activate و PING ممکن است همزمان شوند. فقط یک init واقعی اجرا شود.
+  if (initPromise) {
+    return initPromise;
+  }
 
+  // ایدپوتنت: اگر قبلاً انجام شده، اجرا دوباره نکن (مگر reload اجباری).
+  if (!force && wasmModule && routerReady) {
+    return;
+  }
+
+  initPromise = (async () => {
     console.log("[Ghost SW] Initializing Ghost system...");
 
     // ── Step 1: Import و Init Wasm Module ──────────────────
-    if (!wasmModule) {
-      try {
-        const { default: init, ...exports } = await import(WASM_MODULE_PATH);
-        await init(); // Wasm binary را لود می‌کند
-        wasmModule = exports;
-        wasmReady = true;
-        console.log("[Ghost SW] ✅ Wasm module loaded");
-
-        // broadcast WASM_READY به کل client هاست (UI Connect دکمه را فعال می‌کند)
-        notifyClients({ type: "WASM_READY", version: SW_VERSION });
-      } catch (importErr) {
-        console.error("[Ghost SW] ❌ Wasm import failed:", importErr);
-        throw importErr; // بلوک catch پایین broadcast WASM_FAILED می‌فرستد
-      }
-    }
-
-    // ── Step 2: دریافت Config از Signaling Worker ──────────
-    const configJson = await fetchRoutingConfig();
-    if (!configJson) {
-      console.error("[Ghost SW] ❌ Failed to fetch routing config");
+    const wasmLoaded = await loadWasmModule();
+    if (!wasmLoaded) {
       return;
     }
 
-    // ── Step 3: Init Router با Config ─────────────────────
-    if (!wasmModule.is_router_initialized()) {
-      wasmModule.init_router(configJson);
-      console.log("[Ghost SW] ✅ Declarative Router initialized");
+    // ── Step 2 و 3: Config/Router ─────────────────────────
+    // خطای Config یا Router نباید Wasm آماده را به اشتباه ناکارآمد کند.
+    try {
+      const configJson = await fetchRoutingConfig();
+      if (!configJson) {
+        routerReady = false;
+        console.error("[Ghost SW] ❌ Failed to fetch routing config");
+        await notifyClients({
+          type: "GHOST_ERROR",
+          stage: "config",
+          version: SW_VERSION,
+          error: "Failed to fetch routing config",
+        });
+        return;
+      }
+
+      if (!wasmModule.is_router_initialized()) {
+        wasmModule.init_router(configJson);
+        console.log("[Ghost SW] ✅ Declarative Router initialized");
+      }
+
+      routerReady = true;
+      console.log("[Ghost SW] ✅ System ready — all traffic routed to streaming backend");
+      await notifyClients({ type: "GHOST_READY", version: SW_VERSION });
+    } catch (err) {
+      routerReady = false;
+      console.error("[Ghost SW] ❌ Router initialization failed:", err);
+      await notifyClients({
+        type: "GHOST_ERROR",
+        stage: "router",
+        version: SW_VERSION,
+        error: err?.message || String(err),
+      });
+    }
+  })();
+
+  try {
+    return await initPromise;
+  } finally {
+    initPromise = null;
+  }
+}
+
+/**
+ * Wasm را import/init می‌کند و نتیجه را حتی در صورت شکست صریحاً به UI می‌گوید.
+ * این تابع خطاها را قورت نمی‌دهد: console.error + WASM_FAILED broadcast.
+ */
+async function loadWasmModule() {
+  try {
+    if (!wasmModule) {
+      console.log(`[Ghost SW] Importing Wasm module: ${WASM_MODULE_PATH}`);
+      const { default: init, ...exports } = await import(WASM_MODULE_PATH);
+
+      if (typeof init !== "function") {
+        throw new TypeError("Wasm module has no default init() export");
+      }
+
+      await init(); // Wasm binary را لود می‌کند
+      wasmModule = exports;
     }
 
-    routerReady = true;
-    console.log("[Ghost SW] ✅ System ready — all traffic routed to streaming backend");
+    wasmReady = true;
+    console.log("[Ghost SW] ✅ Wasm module loaded");
 
-    // اطلاع به تمام client های باز
-    notifyClients({ type: "GHOST_READY", version: SW_VERSION });
-
+    // clients.matchAll شامل تب‌های uncontrolled هم باشد؛ در first-load ممکن
+    // است claim هنوز در حال اعمال شدن باشد. UI listener از قبل ثبت شده است.
+    await notifyClients({ type: "WASM_READY", version: SW_VERSION });
+    return true;
   } catch (err) {
-    console.error("[Ghost SW] ❌ Initialization failed:", err);
-    routerReady = false;
+    wasmModule = null;
     wasmReady = false;
-    // اطلاع به کلاینت‌ها که Wasm لود نشد — UI می‌تواند خطای مربوطه را نمایش دهد
-    notifyClients({ type: "WASM_FAILED", version: SW_VERSION }).catch(() => {});
+    routerReady = false;
+
+    // خطای دقیق (مسیر ماژول + exception) در DevTools دیده شود.
+    console.error(
+      `[Ghost SW] ❌ Wasm import/initialization failed (${WASM_MODULE_PATH}):`,
+      err
+    );
+    await notifyClients({
+      type: "WASM_FAILED",
+      version: SW_VERSION,
+      error: err?.message || String(err),
+    });
+    return false;
   }
 }
 
@@ -207,11 +280,21 @@ async function fetchRoutingConfig() {
       }
     }
 
-    // درخواست از Signaling Worker
-    const resp = await fetch(`${SIGNALING_WORKER_URL}/config`, {
-      method: "GET",
-      headers: { "Accept": "application/json" },
-    });
+    // درخواست از Signaling Worker — timeout می‌گذاریم تا activate/Connected
+    // بودن UI وابسته به پاسخ شبکه‌ای کند یا hung نباشد.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    let resp;
+
+    try {
+      resp = await fetch(`${SIGNALING_WORKER_URL}/config`, {
+        method: "GET",
+        headers: { "Accept": "application/json" },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!resp.ok) {
       throw new Error(`Config fetch failed: HTTP ${resp.status}`);
@@ -423,11 +506,36 @@ function getStatus() {
     routerReady,
     hasSession: session !== null,
     wasmLoaded: wasmModule !== null,
+    wasmReady,
     sessionStats: session ? session.stats() : null,
   };
 }
 
 async function notifyClients(message) {
-  const clients = await self.clients.matchAll({ type: "window" });
-  clients.forEach((client) => client.postMessage(message));
+  try {
+    // includeUncontrolled برای first-load ضروری است؛ در غیر این صورت ممکن است
+    // clients.matchAll قبل از اثر کامل claim، تب فعلی را برنگرداند.
+    const clients = await self.clients.matchAll({
+      type: "window",
+      includeUncontrolled: true,
+    });
+
+    if (clients.length === 0) {
+      console.warn(`[Ghost SW] No window clients for ${message.type}`);
+      return 0;
+    }
+
+    clients.forEach((client) => {
+      try {
+        client.postMessage(message);
+      } catch (err) {
+        console.error(`[Ghost SW] Failed to post ${message.type} to client:`, err);
+      }
+    });
+
+    return clients.length;
+  } catch (err) {
+    console.error(`[Ghost SW] clients.matchAll failed for ${message.type}:`, err);
+    return 0;
+  }
 }
