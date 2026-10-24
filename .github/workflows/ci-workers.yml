@@ -161,7 +161,10 @@ jobs:
 
           echo "health=$CODE sub=$SUB vless=$VLESS"
           { echo "### workerd (local) — health=$CODE sub=$SUB vless=$VLESS"; echo '```'; tail -n 30 /tmp/dev.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$CODE" = "200" ] || echo "::warning title=workerd (local)::returned $CODE — the production canary below is the real gate"
+          if [ "$CODE" != "200" ]; then
+            MSG=$(tail -n 20 /tmp/dev.log 2>/dev/null | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | head -c 900)
+            echo "::warning title=workerd (local)::$CODE — the production canary is the real gate%0A$MSG"
+          fi
           exit 0
 
       # ── canary: همان artifact روی رانتایم production ────────────
@@ -203,7 +206,7 @@ jobs:
 
           BODY=$(head -c 200 /tmp/canary.json 2>/dev/null)
           if [ "$CODE" != "200" ]; then
-            emit "canary /health" "production runtime returned $CODE — body: $BODY"
+            emit "canary /health" "$HOST returned $CODE — body: $BODY"
             exit 1
           fi
           printf '%s' "$BODY" | grep -q '"worker":"ghost-streaming"' || { emit "canary body" "unexpected payload: $BODY"; exit 1; }
