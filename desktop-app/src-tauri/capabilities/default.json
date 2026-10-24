@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "حداقل دسترسی‌های لازم برای پنجرهٔ اصلی برنامه",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

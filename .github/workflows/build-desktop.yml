@@ -1,0 +1,238 @@
+name: build-desktop
+
+# ساخت و انتشار کلاینت دسکتاپ ویندوز (Tauri v2 + sidecar هستهٔ meow).
+# فقط پوشهٔ desktop-app؛ هیچ‌کدام از workerها، docs یا browser-wasm لمس نمی‌شوند.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-app/**'
+      - '.github/workflows/build-desktop.yml'
+  pull_request:
+    paths:
+      - 'desktop-app/**'
+      - '.github/workflows/build-desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+  # نسخهٔ هستهٔ پراکسی — تنها جایی که باید به‌روزرسانی شود
+  CORE_VERSION: v0.26.1
+  CORE_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  # ── ۱) اعتبارسنجی ─────────────────────────────────────────────
+  check:
+    name: Core fetch + config + cargo check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-app/src-tauri -> target
+          key: desktop-check
+
+      # بدون این، Tauri در زمان build به externalBin شکایت می‌کند.
+      - name: Fetch proxy core (meow, sha256 verified)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset  = "meow-$env:CORE_VERSION-$env:CORE_TARGET.zip"
+          $base   = "https://github.com/meow-rs/meow-rs/releases/download/$env:CORE_VERSION"
+          $work   = Join-Path $env:RUNNER_TEMP 'meow-core'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          Write-Host "downloading $base/$asset"
+          Invoke-WebRequest -Uri "$base/$asset"        -OutFile "$work/core.zip"   -UseBasicParsing
+          Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile "$work/core.sha256" -UseBasicParsing
+
+          $expected = [regex]::Match((Get-Content "$work/core.sha256" -Raw), '\b[0-9a-fA-F]{64}\b').Value.ToLower()
+          if ($expected.Length -ne 64) { throw "could not read a sha256 digest from core.sha256" }
+          $actual = (Get-FileHash "$work/core.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "sha256 mismatch: expected $expected, got $actual" }
+          Write-Host "sha256 verified: $actual"
+
+          Expand-Archive -Path "$work/core.zip" -DestinationPath "$work/extract" -Force
+          $exe = Get-ChildItem -Path "$work/extract" -Recurse -Filter 'meow.exe' | Select-Object -First 1
+          if (-not $exe) {
+            Get-ChildItem -Recurse "$work/extract" | ForEach-Object { Write-Host $_.FullName }
+            throw 'meow.exe not found inside the archive'
+          }
+
+          $binDir = 'desktop-app/src-tauri/binaries'
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          Copy-Item $exe.FullName (Join-Path $binDir "meow-$env:CORE_TARGET.exe") -Force
+
+          # اگر zip نسخهٔ همراه wintun.dll را داشت، کنار sidecar نگه می‌داریم
+          # (meow در نبود آن هم کپی تعبیه‌شده را استخراج می‌کند).
+          $dll = Get-ChildItem -Path "$work/extract" -Recurse -Filter 'wintun.dll' | Select-Object -First 1
+          if ($dll) { Copy-Item $dll.FullName (Join-Path $binDir 'wintun.dll') -Force }
+
+          $built = Get-Item (Join-Path $binDir "meow-$env:CORE_TARGET.exe")
+          Write-Host ("sidecar: {0} ({1:N1} MB)" -f $built.Name, ($built.Length / 1MB))
+
+      - name: Setup Python deps
+        shell: bash
+        run: python -m pip install --quiet --disable-pip-version-check pyyaml
+
+      - name: Core config generator tests
+        shell: bash
+        run: node desktop-app/tools/test_core_config.cjs
+
+      - name: Validate manifest/config/sidecar
+        shell: bash
+        run: python desktop-app/tools/verify_config.py --require-sidecar
+
+      - name: Syntax-check the frontend
+        shell: bash
+        run: |
+          node --check desktop-app/src/core-config.js
+          node --check desktop-app/src/main.js
+
+      # آزمون DOM؛ اگر رجیستری npm در دسترس نبود، انتشار را متوقف نمی‌کند.
+      - name: UI wiring test (jsdom)
+        continue-on-error: true
+        shell: bash
+        run: |
+          npm install --silent --no-fund --no-audit --prefix desktop-app/.tools jsdom
+          NODE_PATH="$PWD/desktop-app/.tools/node_modules" node desktop-app/tools/test_ui.cjs
+
+      # خروجی کامپایلر به‌صورت annotation منتشر می‌شود تا از API قابل خواندن
+      # باشد (لاگ خام روی storage خارجی است و در همه‌جا در دسترس نیست).
+      - name: cargo check
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'cargo-check.log'
+          cargo check --manifest-path desktop-app/src-tauri/Cargo.toml --message-format=short 2>&1 |
+            Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $problems = Get-Content $log |
+              Where-Object { $_ -match 'error(\[E\d+\])?:|^error:|--> ' } |
+              Select-Object -First 40
+            foreach ($line in $problems) {
+              Write-Host ("::error::" + ($line -replace '%', '%25' -replace '\r', '' -replace '\n', ' '))
+            }
+            exit 1
+          }
+
+  # ── ۲) ساخت ویندوز + انتشار ───────────────────────────────────
+  build:
+    name: Windows installer
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-app/src-tauri -> target
+          key: desktop-release
+
+      - name: Fetch proxy core (meow, sha256 verified)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset  = "meow-$env:CORE_VERSION-$env:CORE_TARGET.zip"
+          $base   = "https://github.com/meow-rs/meow-rs/releases/download/$env:CORE_VERSION"
+          $work   = Join-Path $env:RUNNER_TEMP 'meow-core'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          Invoke-WebRequest -Uri "$base/$asset"        -OutFile "$work/core.zip"    -UseBasicParsing
+          Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile "$work/core.sha256" -UseBasicParsing
+
+          $expected = [regex]::Match((Get-Content "$work/core.sha256" -Raw), '\b[0-9a-fA-F]{64}\b').Value.ToLower()
+          if ($expected.Length -ne 64) { throw "could not read a sha256 digest from core.sha256" }
+          $actual = (Get-FileHash "$work/core.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "sha256 mismatch: expected $expected, got $actual" }
+
+          Expand-Archive -Path "$work/core.zip" -DestinationPath "$work/extract" -Force
+          $exe = Get-ChildItem -Path "$work/extract" -Recurse -Filter 'meow.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'meow.exe not found inside the archive' }
+
+          $binDir = 'desktop-app/src-tauri/binaries'
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+          Copy-Item $exe.FullName (Join-Path $binDir "meow-$env:CORE_TARGET.exe") -Force
+
+          $dll = Get-ChildItem -Path "$work/extract" -Recurse -Filter 'wintun.dll' | Select-Object -First 1
+          if ($dll) { Copy-Item $dll.FullName (Join-Path $binDir 'wintun.dll') -Force }
+
+      - name: Decide release target
+        id: target
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "mode=build-only" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "tag=desktop-v__VERSION__" >> "$GITHUB_OUTPUT"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "mode=build-only" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and publish on main)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop-app
+          tagName: ${{ steps.target.outputs.tag }}
+          releaseName: 'SCP-GHOST Desktop v__VERSION__'
+          releaseBody: |
+            کلاینت دسکتاپ ویندوز — Tauri v2 + هستهٔ پراکسی meow (mihomo-compatible).
+
+            **فایل‌ها**
+            - `*_x64-setup.exe` — نصب‌کنندهٔ NSIS (پیشنهادی)
+            - `*_x64_en-US.msi` — بستهٔ MSI برای نصب سازمانی
+
+            **اجرا**
+            1. `setup.exe` را اجرا کنید (نصب برای کاربر جاری).
+            2. برنامه هنگام اجرا با UAC بالا می‌آید؛ این برای ساخت آداپتور TUN لازم است.
+            3. آدرس اشتراک VLESS را وارد کنید → «دریافت و بررسی» → «اتصال».
+            4. لاگ هسته در پایین پنجره وضعیت واقعی را نشان می‌دهد.
+
+            اگر SmartScreen هشدار داد: More info → Run anyway (امضای تجاری ندارد).
+            WebView2 در ویندوز ۱۰/۱۱ از پیش نصب است.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
+          retryAttempts: 2
+          args: --bundles nsis,msi
+
+      - name: Upload installers as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scp-ghost-windows-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            desktop-app/src-tauri/target/release/bundle/nsis/*.exe
+            desktop-app/src-tauri/target/release/bundle/msi/*.msi
