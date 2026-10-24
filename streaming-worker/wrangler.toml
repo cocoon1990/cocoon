@@ -43,7 +43,7 @@ id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 #   openssl rand -hex 32
 
 [vars]
-WORKER_VERSION   = "5.2.5"
+WORKER_VERSION   = "5.2.6"
 CONFIG_KV_KEY    = "routing_config"
 RATE_LIMIT_RPM   = "500"
 RATE_WINDOW_MS   = "60000"
