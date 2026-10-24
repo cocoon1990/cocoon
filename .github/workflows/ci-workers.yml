@@ -179,7 +179,9 @@ jobs:
           {
             echo "codes:$CODES"
             echo "--- body ---"; head -c 600 /tmp/body.txt 2>/dev/null || true
-            echo; echo "--- dev.log (last 20) ---"; tail -n 20 /tmp/dev.log 2>/dev/null || true
+            echo "--- build/worker ---"; ls -l build/worker 2>/dev/null || true
+            echo "--- dry-run summary ---"; grep -E 'Total Upload|Your Worker has access|Total' /tmp/dry.log 2>/dev/null || tail -n 12 /tmp/dry.log 2>/dev/null || true
+            echo "--- dev.log (last 20) ---"; tail -n 20 /tmp/dev.log 2>/dev/null || true
           } > /tmp/report.txt
 
           python3 - <<'PY'
@@ -195,5 +197,41 @@ jobs:
           for i, chunk in enumerate(chunks[:8]):
               chunk = chunk.replace('%', '%25').replace('%250A', '%0A')
               print(f"::error title=workerd-run-{i}::{chunk}")
+          PY
+          exit 0
+      # ── آزمون قاطع: همین build را با wrangler@latest دیپلوی کن ──
+      # worker در Mainnet با 1101 می‌میرد ولی در workerd محلی ۲۰۰ می‌دهد.
+      # این گام مسیر دیپلوی (action در برابر CLI) را عوض می‌کند.
+      - name: Deploy same build with wrangler CLI, then probe
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        working-directory: streaming-worker
+        run: |
+          set -uo pipefail
+          npx --yes wrangler@latest deploy > /tmp/deploy.log 2>&1
+          echo "deploy rc=$?"
+          tail -n 8 /tmp/deploy.log > /tmp/probe2.txt
+          sleep 15
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -o /tmp/body2.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=pr-$GITHUB_RUN_ID-$i" || true)
+            echo "attempt $i -> $CODE" >> /tmp/probe2.txt
+            [ "$CODE" = "200" ] && break
+            sleep 10
+          done
+          head -c 400 /tmp/body2.txt >> /tmp/probe2.txt 2>/dev/null || true
+          python3 - <<'PY'
+          import pathlib
+          report = pathlib.Path('/tmp/probe2.txt').read_text(errors='replace')
+          cur = ''
+          chunks = []
+          for line in report.splitlines():
+              if len(cur) + len(line) > 900:
+                  chunks.append(cur); cur = ''
+              cur += line + '%0A'
+          if cur: chunks.append(cur)
+          for i, chunk in enumerate(chunks[:6]):
+              print(f"::error title=cli-deploy-{i}::{chunk.replace('%', '%25').replace('%250A', '%0A')}")
           PY
           exit 0
