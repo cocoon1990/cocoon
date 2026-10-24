@@ -286,9 +286,8 @@ jobs:
           ls -l build/worker/ | head -6
           exit 0
 
-      # ══ V5: روتینگ واقعی، بدنهٔ هندلرها دست‌نخورده ══════════════════
-      # ══ V6: همان کد با پروفایل ساخت متفاوت ═════════════════════════
-      - name: Probe V5 (real handlers) + V6 (opt-level s / thin LTO)
+      # ══ کدام هندلر بودجهٔ ماژول را می‌شکند؟ ══════════════════════════
+      - name: Probe S1 (stream) / S2 (sub) / S3 (vless)
         if: always()
         continue-on-error: true
         env:
@@ -296,22 +295,21 @@ jobs:
         run: |
           set -u
           cd streaming-worker
-          OUT=/tmp/v.txt; : > "$OUT"
+          OUT=/tmp/s.txt; : > "$OUT"
           cp src/lib.rs /tmp/lib.real.rs
-          cp Cargo.toml /tmp/Cargo.real.toml
 
           deploy_probe() {
             printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n' "$1" > "wrangler.$1.toml"
             set +e
-            npx --yes wrangler@latest deploy -c "wrangler.$1.toml" > "/tmp/v-$1.log" 2>&1
+            npx --yes wrangler@latest deploy -c "wrangler.$1.toml" > "/tmp/s-$1.log" 2>&1
             RC=$?
             set -e
             sleep 15
-            CODE=$(curl -sS -o "/tmp/v-$1.body" -w '%{http_code}' --max-time 15 \
+            CODE=$(curl -sS -o "/tmp/s-$1.body" -w '%{http_code}' --max-time 15 \
               "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
-            printf '%s: deploy_rc=%s health=%s size=%s body=%s\n' "$1" "$RC" "$CODE" \
-              "$(wc -c < build/worker/shim.wasm 2>/dev/null || echo 0)" \
-              "$(head -c 220 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+            W=$(find build -name '*.wasm' -exec wc -c {} \; 2>/dev/null | awk '{s+=$1} END {print s+0}')
+            printf '%s: rc=%s health=%s wasm=%s body=%s\n' "$1" "$RC" "$CODE" "$W" \
+              "$(head -c 160 "/tmp/s-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
           }
 
           patch_main() {
@@ -325,36 +323,26 @@ jobs:
           PY
           }
 
-          V5="#[event(fetch)]
-          pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-              let router = Router::new()
-                  .get_async(\"/stream\", handle_stream)
-                  .get_async(\"/vless\", handle_vless)
-                  .get_async(\"/sub\", handle_subscription)
-                  .get(\"/health\", |_r, c| Response::ok(
-                      c.var(\"WORKER_VERSION\").map(|x| x.to_string()).unwrap_or_else(|_| \"unknown\".to_string())));
-              router.run(req, env).await
-          }"
+          mk_main() { # $1 = route-path, $2 = handler
+            printf '#[event(fetch)]\npub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {\n    let router = Router::new()\n        .get_async("%s", %s)\n        .get("/health", |_r, _c| Response::ok("ok"));\n    router.run(req, env).await\n}\n' "$1" "$2"
+          }
 
-          patch_main "$V5"
-          worker-build --release > /tmp/v5-build.log 2>&1 || echo "V5 build FAILED" >> "$OUT"
-          deploy_probe ghost-v5-realhandlers
+          patch_main "$(mk_main /stream handle_stream)"
+          worker-build --release > /tmp/s1.log 2>&1 || echo "S1 build FAILED" >> "$OUT"
+          deploy_probe ghost-s1-stream
           cp /tmp/lib.real.rs src/lib.rs
 
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path('Cargo.toml')
-          s = p.read_text()
-          s = s.replace('opt-level     = "z"', 'opt-level     = "s"')
-          s = s.replace('lto           = "fat"', 'lto           = "thin"')
-          s = s.replace('codegen-units = 1', 'codegen-units = 16')
-          p.write_text(s)
-          PY
-          worker-build --release > /tmp/v6-build.log 2>&1 || echo "V6 build FAILED" >> "$OUT"
-          deploy_probe ghost-v6-profile
-          cp /tmp/Cargo.real.toml Cargo.toml
+          patch_main "$(mk_main /sub handle_subscription)"
+          worker-build --release > /tmp/s2.log 2>&1 || echo "S2 build FAILED" >> "$OUT"
+          deploy_probe ghost-s2-sub
+          cp /tmp/lib.real.rs src/lib.rs
 
-          grep -ahE '^error(\[|:)' /tmp/v5-build.log /tmp/v6-build.log | head -4 >> "$OUT" || true
+          patch_main "$(mk_main /vless handle_vless)"
+          worker-build --release > /tmp/s3.log 2>&1 || echo "S3 build FAILED" >> "$OUT"
+          deploy_probe ghost-s3-vless
+          cp /tmp/lib.real.rs src/lib.rs
+
+          grep -ahE '^error(\[|:)' /tmp/s1.log /tmp/s2.log /tmp/s3.log | head -4 >> "$OUT" || true
           rm -f wrangler.ghost-*.toml
           MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-900)
-          echo "::error title=probe-V56::$MSG"
+          echo "::error title=probe-S123::$MSG"
