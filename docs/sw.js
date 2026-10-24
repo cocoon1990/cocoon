@@ -388,7 +388,7 @@ async function handleFetch(request) {
 
   const url = request.url;
   const contentType = request.headers.get("Content-Type") || "";
-  const contentLength = parseInt(request.headers.get("Content-Length") || "-1", 10);
+  const contentLength = parseInt(request.headers.get("Content-Length") || "0", 10) || 0;
 
   try {
     // ── تصمیم‌گیری routing توسط Rust Router ───────────────

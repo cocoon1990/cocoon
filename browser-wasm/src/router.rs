@@ -325,7 +325,10 @@ pub fn init_router(config_json: &str) -> Result<(), JsValue> {
 pub fn route_request(
     url: &str,
     content_type: &str,
-    size_hint: i64, // i64 چون JS number می‌تواند منفی باشد (ناشناخته = -1)
+    // f64 (نه i64): wasm-bindgen برای i64 از JS انتظار BigInt دارد و
+    // عبور یک Number معمولی خطای «Cannot convert -1 to a BigInt» می‌دهد.
+    // f64 مستقیماً به JS Number نگاشت می‌شود.
+    size_hint: f64,
 ) -> Result<String, JsValue> {
     let router = ROUTER
         .get()
@@ -337,10 +340,11 @@ pub fn route_request(
         Some(content_type)
     };
 
-    let sz = if size_hint < 0 {
-        None
-    } else {
+    // 0 / منفی / NaN = اندازه نامشخص
+    let sz = if size_hint.is_finite() && size_hint > 0.0 {
         Some(size_hint as u64)
+    } else {
+        None
     };
 
     let decision = router.route(url, ct, sz);
