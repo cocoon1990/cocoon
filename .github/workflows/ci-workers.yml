@@ -286,8 +286,8 @@ jobs:
           ls -l build/worker/ | head -6
           exit 0
 
-      # ══ بایسکت کد/وابستگی‌ها — هر variant جدا deploy می‌شود ═════════
-      - name: Probe V1 (no d1 feature) + V2 (minimal main)
+      # ══ بایسکت مسیر درخواست: Router یا هندلرها؟ ════════════════════
+      - name: Probe V3 (Router only) + V4 (no Router)
         if: always()
         continue-on-error: true
         env:
@@ -297,45 +297,70 @@ jobs:
           cd streaming-worker
           OUT=/tmp/v.txt; : > "$OUT"
           cp src/lib.rs /tmp/lib.real.rs
-          cp Cargo.toml /tmp/Cargo.real.toml
 
-          deploy_probe() { # $1=name
+          deploy_probe() {
             printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n' "$1" > "wrangler.$1.toml"
             set +e
             npx --yes wrangler@latest deploy -c "wrangler.$1.toml" > "/tmp/v-$1.log" 2>&1
             RC=$?
             set -e
-            sleep 18
-            CODE=$(curl -sS -o "/tmp/v-$1.body" -w '%{http_code}' --max-time 15               "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
-            printf '%s: deploy_rc=%s health=%s body=%s\n' "$1" "$RC" "$CODE"               "$(head -c 50 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+            sleep 15
+            CODE=$(curl -sS -o "/tmp/v-$1.body" -w '%{http_code}' --max-time 15 \
+              "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
+            printf '%s: deploy_rc=%s health=%s body=%s\n' "$1" "$RC" "$CODE" \
+              "$(head -c 300 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
           }
 
-          # ── V1: بدون feature d1
-          sed -i 's/features = \["d1"\]/features = []/' Cargo.toml
-          grep -n '^worker' Cargo.toml >> "$OUT" || true
-          worker-build --release > /tmp/v1-build.log 2>&1 || echo "V1 build FAILED" >> "$OUT"
-          deploy_probe ghost-v1-nod1
-          cp /tmp/Cargo.real.toml Cargo.toml
-
-          # ── V2: همان کد، ولی main فقط "v2" برمی‌گرداند
-          python3 - <<'PY'
-          import pathlib
+          patch_main() {
+            python3 - "$1" <<'PY'
+          import pathlib, sys
+          main_rs = sys.argv[1]
           p = pathlib.Path('src/lib.rs')
           lines = p.read_text().splitlines(True)
           start = next(i for i, l in enumerate(lines) if l.startswith('#[event(fetch)]'))
-          end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip() in ('}', '} '))
-          stub = (
-              '#[event(fetch)]\n'
-              'pub async fn main(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n'
-              '    Response::ok("v2")\n'
-              '}\n'
-          )
-          p.write_text(''.join(lines[:start]) + stub + ''.join(lines[end + 1:]))
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip() == '}')
+          p.write_text(''.join(lines[:start]) + main_rs + ''.join(lines[end + 1:]))
           PY
-          worker-build --release > /tmp/v2-build.log 2>&1 || echo "V2 build FAILED" >> "$OUT"
-          deploy_probe ghost-v2-minmain
+          }
+
+          V3="#[event(fetch)]
+          pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+              let mut s = String::from(\"A\");
+              let p = req.path();
+              s.push('B');
+              let m = req.method().to_string();
+              s.push('C');
+              let v = env.var(\"WORKER_VERSION\").ok().map(|x| x.to_string()).unwrap_or_default();
+              s.push('D');
+              let router = Router::new().get(\"/health\", |_r, _c| Response::ok(\"inner\"));
+              s.push('E');
+              match router.run(req, env).await {
+                  Ok(res) => Response::ok(format!(\"{}|F|{}|{}|{}|{}\", s, p, m, v, res.status_code())),
+                  Err(e) => Response::ok(format!(\"{}|ERR|{}\", s, e.to_string())),
+              }
+          }"
+
+          V4="#[event(fetch)]
+          pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+              let path = req.path();
+              if path == \"/health\" {
+                  let v = env.var(\"WORKER_VERSION\").ok().map(|x| x.to_string()).unwrap_or_default();
+                  return Response::ok(format!(\"{{\\\"status\\\":\\\"ok\\\",\\\"version\\\":\\\"{}\\\",\\\"route\\\":\\\"manual\\\"}}\", v));
+              }
+              Response::error(\"not implemented in probe\", 501)
+          }"
+
+          patch_main "$V3"
+          worker-build --release > /tmp/v3-build.log 2>&1 || echo "V3 build FAILED" >> "$OUT"
+          deploy_probe ghost-v3-router
           cp /tmp/lib.real.rs src/lib.rs
 
+          patch_main "$V4"
+          worker-build --release > /tmp/v4-build.log 2>&1 || echo "V4 build FAILED" >> "$OUT"
+          deploy_probe ghost-v4-manual
+          cp /tmp/lib.real.rs src/lib.rs
+
+          grep -ahE '^error' /tmp/v3-build.log /tmp/v4-build.log | head -4 >> "$OUT" || true
           rm -f wrangler.ghost-*.toml
-          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-850)
-          echo "::error title=probe-V::$MSG"
+          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-900)
+          echo "::error title=probe-V34::$MSG"
