@@ -530,9 +530,14 @@ fn is_valid_sub_path(path: &str) -> bool {
 /// خواندن یک تنظیم از secret یا var (secret اولویت دارد).
 /// مقدار trim‌شده برمی‌گردد؛ اگر هیچ‌کدام نبود، رشتهٔ خالی.
 fn read_setting(ctx: &RouteContext<()>, name: &str) -> String {
-    ctx.secret(name)
-        .ok()
-        .or_else(|| ctx.var(name).ok())
+    // توجه: `Env::secret()` نوع `Secret` برمی‌گرداند و `Env::var()` نوع
+    // `String`. هر دو Display هستند، پس اول به String نرمال می‌شوند تا
+    // این دو Option هم‌نوع باشند.
+    let from_secret = ctx.secret(name).ok().map(|value| value.to_string());
+    let from_var = ctx.var(name).ok().map(|value| value.to_string());
+
+    from_secret
+        .or(from_var)
         .map(|value| value.trim().to_string())
         .unwrap_or_default()
 }
@@ -582,8 +587,9 @@ async fn handle_subscription(req: Request, ctx: RouteContext<()>) -> Result<Resp
     // ── ۱. توکن ──────────────────────────────────────────────
     let token = ctx
         .secret("SUB_TOKEN")
-        .map(|v| v.trim().to_string())
+        .map(|v| v.to_string())
         .unwrap_or_default();
+    let token = token.trim().to_string();
 
     // بدون توکن قوی، endpoint هیچ چیزی سرو نمی‌کند.
     if token.len() < SUB_TOKEN_MIN_LEN {
