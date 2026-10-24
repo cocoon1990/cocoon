@@ -270,8 +270,24 @@ jobs:
           MSG="B rs-probe -> HTTP $CODE | body=$(head -c 80 body.txt | tr '\n' ' ')%0A$(grep -E 'build rc|deploy rc|error' build.log | tail -n 3 | tr '\n' ' ' | cut -c1-240)"
           echo "::error title=probe-B-rust::$MSG"
 
-      # ۳) همان build فعلی، ولی بدون nodejs_compat → ایزوله کردن کامپَت‌فلگ‌ها.
-      - name: Probe C — same build without nodejs_compat
+      # ══ چه ماژول‌هایی import می‌شوند؟ ═════════════════════════════
+      - name: Dump bundle imports
+        if: always()
+        continue-on-error: true
+        run: |
+          set -u
+          cd streaming-worker
+          npx --yes wrangler@latest deploy --dry-run --outdir /tmp/dry >/dev/null 2>&1 || true
+          echo "--- shim.mjs imports ---"
+          grep -oE 'from ?"[^"]+"' build/worker/shim.mjs 2>/dev/null | sort -u || echo none
+          echo "--- bundle imports ---"
+          grep -ohE 'from ?"[^":]+:[^"]+"' /tmp/dry/*.js 2>/dev/null | sort -u || echo none
+          echo "--- files ---"
+          ls -l build/worker/ | head -6
+          exit 0
+
+      # ══ بایسکت کد/وابستگی‌ها — هر variant جدا deploy می‌شود ═════════
+      - name: Probe V1 (no d1 feature) + V2 (minimal main)
         if: always()
         continue-on-error: true
         env:
@@ -279,54 +295,47 @@ jobs:
         run: |
           set -u
           cd streaming-worker
-          sed -e '1s/.*/name = "ghost-streaming-nocompat"/' -e '/compatibility_flags/d' wrangler.toml > wrangler.nocompat.toml
-          npx --yes wrangler@latest deploy -c wrangler.nocompat.toml > /tmp/nc.log 2>&1
-          echo "deploy rc=$?" >> /tmp/nc.log
-          sleep 25
-          CODE=$(curl -sS -o /tmp/ncb.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-nocompat.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
-          MSG="C no-compat -> HTTP $CODE | body=$(head -c 80 /tmp/ncb.txt | tr '\n' ' ')%0A$(tail -n 3 /tmp/nc.log | tr '\n' ' ' | cut -c1-240)"
-          echo "::error title=probe-C-nocompat::$MSG"
+          OUT=/tmp/v.txt; : > "$OUT"
+          cp src/lib.rs /tmp/lib.real.rs
+          cp Cargo.toml /tmp/Cargo.real.toml
 
-      # ══ بایسکت bindings — همان artifact، فقط کانفیگ عوض می‌شود ══════
-      # (بدون rebuild؛ فقط shim.mjs + shim.wasm قبلی deploy می‌شود)
-      - name: Probe D-G — same wasm, different bindings/compat
-        if: always()
-        continue-on-error: true
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          set -u
-          cd streaming-worker
-          OUT=/tmp/dg.txt; : > "$OUT"
-          HDR='main = "build/worker/shim.mjs"'
-
-          mk() {
-            NAME="$1"; FILE="$2"; DATE="$3"; EXTRA="$4"
-            CFG="wrangler.probe-$NAME.toml"
-            printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "%s"\n%s\n' \
-              "$NAME" "$DATE" "$EXTRA" > "$CFG"
+          deploy_probe() { # $1=name
+            printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n' "$1" > "wrangler.$1.toml"
             set +e
-            npx --yes wrangler@latest deploy -c "$CFG" > "/tmp/d-$NAME.log" 2>&1
+            npx --yes wrangler@latest deploy -c "wrangler.$1.toml" > "/tmp/v-$1.log" 2>&1
             RC=$?
             set -e
             sleep 18
-            CODE=$(curl -sS -o "/tmp/d-$NAME.body" -w '%{http_code}' --max-time 15 \
-              "https://$NAME.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
-            printf 'D[%s] rc=%s health=%s body=%s\n' "$NAME" "$RC" "$CODE" \
-              "$(head -c 60 /tmp/d-$NAME.body 2>/dev/null | tr '\n' ' ')" >> "$OUT"
-            if [ "$RC" != "0" ]; then
-              echo "  log: $(tail -n 3 /tmp/d-$NAME.log | tr '\n' ' ' | cut -c1-200)" >> "$OUT"
-            fi
+            CODE=$(curl -sS -o "/tmp/v-$1.body" -w '%{http_code}' --max-time 15               "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
+            printf '%s: deploy_rc=%s health=%s body=%s\n' "$1" "$RC" "$CODE"               "$(head -c 50 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
           }
 
-          KV='[[kv_namespaces]]\nbinding = "GHOST_CONFIG"\nid = "e9277d0612d04fae97e8d0d7ac6dc87d"'
-          DO='[[durable_objects.bindings]]\nname = "RATE_LIMITER"\nclass_name = "SlidingWindowRateLimiter"\n\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["SlidingWindowRateLimiter"]'
+          # ── V1: بدون feature d1
+          sed -i 's/features = \["d1"\]/features = []/' Cargo.toml
+          grep -n '^worker' Cargo.toml >> "$OUT" || true
+          worker-build --release > /tmp/v1-build.log 2>&1 || echo "V1 build FAILED" >> "$OUT"
+          deploy_probe ghost-v1-nod1
+          cp /tmp/Cargo.real.toml Cargo.toml
 
-          mk ghost-streaming-nobind   /tmp/wn.toml 2025-10-01 ""
-          mk ghost-streaming-kvonly   /tmp/wk.toml 2025-10-01 "$(printf "$KV")"
-          mk ghost-streaming-doonly   /tmp/wd.toml 2025-10-01 "$(printf "$DO")"
-          mk ghost-streaming-olddate  /tmp/wo.toml 2024-09-23 ""
-          rm -f wrangler.probe-*.toml
+          # ── V2: همان کد، ولی main فقط "v2" برمی‌گرداند
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('src/lib.rs')
+          lines = p.read_text().splitlines(True)
+          start = next(i for i, l in enumerate(lines) if l.startswith('#[event(fetch)]'))
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip() in ('}', '} '))
+          stub = (
+              '#[event(fetch)]\n'
+              'pub async fn main(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n'
+              '    Response::ok("v2")\n'
+              '}\n'
+          )
+          p.write_text(''.join(lines[:start]) + stub + ''.join(lines[end + 1:]))
+          PY
+          worker-build --release > /tmp/v2-build.log 2>&1 || echo "V2 build FAILED" >> "$OUT"
+          deploy_probe ghost-v2-minmain
+          cp /tmp/lib.real.rs src/lib.rs
 
+          rm -f wrangler.ghost-*.toml
           MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-850)
-          echo "::error title=probe-D-G::$MSG"
+          echo "::error title=probe-V::$MSG"
