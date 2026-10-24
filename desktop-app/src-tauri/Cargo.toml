@@ -21,7 +21,10 @@ tauri-plugin-updater = { version = "2", default-features = false, features = [
 ] }
 
 # ── سریال‌سازی پاسخ دستورها ────────────────────────────────────
+# serde_json به‌صورت مستقیم لازم است: ماکروی `#[tauri::command]` برای
+# دستورهای async آرگومان‌ها را از همین مسیر دی‌کد می‌کند.
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # هیچ کلاینت HTTP و هیچ سوکتی در این crate نیست: اشتراک با fetch خودِ
 # webview گرفته می‌شود و همهٔ ترافیک تونل کار sidecar است.
