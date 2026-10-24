@@ -208,7 +208,7 @@ const CORS_EXPOSE: &str =
     "X-Ghost-Worker, X-Ghost-Sub, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining";
 
 /// افزودن هدرهای CORS به یک پاسخ موجود (بدون دست‌زدن به بدنه)
-fn with_cors(res: Response) -> Response {
+fn with_cors(mut res: Response) -> Response {
     let headers = res.headers_mut();
     let _ = headers.set("Access-Control-Allow-Origin", "*");
     let _ = headers.set("Vary", "Origin");
