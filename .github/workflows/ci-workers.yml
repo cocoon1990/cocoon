@@ -286,3 +286,42 @@ jobs:
           CODE=$(curl -sS -o /tmp/ncb.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-nocompat.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
           MSG="C no-compat -> HTTP $CODE | body=$(head -c 80 /tmp/ncb.txt | tr '\n' ' ')%0A$(tail -n 3 /tmp/nc.log | tr '\n' ' ' | cut -c1-240)"
           echo "::error title=probe-C-nocompat::$MSG"
+
+      # ══ بایسکت bindings — همان artifact، فقط کانفیگ عوض می‌شود ══════
+      # (بدون rebuild؛ فقط shim.mjs + shim.wasm قبلی deploy می‌شود)
+      - name: Probe D-G — same wasm, different bindings/compat
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          cd streaming-worker
+          OUT=/tmp/dg.txt; : > "$OUT"
+          HDR='main = "build/worker/shim.mjs"'
+
+          mk() {
+            NAME="$1"; FILE="$2"; DATE="$3"; EXTRA="$4"
+            printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "%s"\n%s\n' \
+              "$NAME" "$DATE" "$EXTRA" > "$FILE"
+            set +e
+            npx --yes wrangler@latest deploy -c "$FILE" > "/tmp/d-$NAME.log" 2>&1
+            RC=$?
+            set -e
+            sleep 18
+            CODE=$(curl -sS -o "/tmp/d-$NAME.body" -w '%{http_code}' --max-time 15 \
+              "https://$NAME.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
+            printf 'D[%s] rc=%s health=%s body=%s\n' "$NAME" "$RC" "$CODE" \
+              "$(head -c 60 /tmp/d-$NAME.body 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+          }
+
+          KV='[[kv_namespaces]]\nbinding = "GHOST_CONFIG"\nid = "e9277d0612d04fae97e8d0d7ac6dc87d"'
+          DO='[[durable_objects.bindings]]\nname = "RATE_LIMITER"\nclass_name = "SlidingWindowRateLimiter"\n\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["SlidingWindowRateLimiter"]'
+
+          mk ghost-streaming-nobind   /tmp/wn.toml 2025-10-01 ""
+          mk ghost-streaming-kvonly   /tmp/wk.toml 2025-10-01 "$(printf "$KV")"
+          mk ghost-streaming-doonly   /tmp/wd.toml 2025-10-01 "$(printf "$DO")"
+          mk ghost-streaming-olddate  /tmp/wo.toml 2024-09-23 ""
+
+          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-850)
+          echo "::error title=probe-D-G::$MSG"
