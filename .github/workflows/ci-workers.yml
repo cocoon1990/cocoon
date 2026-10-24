@@ -235,3 +235,52 @@ jobs:
               print(f"::error title=cli-deploy-{i}::{chunk.replace('%', '%25').replace('%250A', '%0A')}")
           PY
           exit 0
+      # ── گرفتن استثنای واقعی با wrangler tail ────────────────────
+      # health فقط «1101» می‌دهد؛ متن استثنا تنها از طریق tail می‌آید.
+      - name: Capture the live exception with wrangler tail
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          ACC=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"                 https://api.cloudflare.com/client/v4/accounts                 | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['result'][0]['id'] if d.get('result') else '')")
+          echo "account=${ACC:0:6}…"
+          export CLOUDFLARE_ACCOUNT_ID="$ACC"
+
+          npx --yes wrangler@latest tail ghost-streaming-worker --format json > /tmp/tail.json 2>/tmp/tail.err &
+          TP=$!
+          sleep 30
+          curl -s -o /dev/null -w 'probe=%{http_code}\n' --max-time 15             "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=tail-$GITHUB_RUN_ID" || true
+          sleep 12
+          kill $TP 2>/dev/null || true
+
+          python3 - <<'PY'
+          import json, pathlib, re
+          raw = pathlib.Path('/tmp/tail.json').read_text(errors='replace')
+          err = pathlib.Path('/tmp/tail.err').read_text(errors='replace')
+          lines = []
+          for line in raw.splitlines():
+              line = line.strip()
+              if not line.startswith('{'):
+                  continue
+              try:
+                  doc = json.loads(line)
+              except Exception:
+                  continue
+              for exc in doc.get('exceptions', []) or []:
+                  lines.append(f"EXC {exc.get('name')}: {exc.get('message')}")
+              for log in doc.get('logs', []) or []:
+                  msg = log.get('message')
+                  if isinstance(msg, list):
+                      msg = ' '.join(str(m) for m in msg)
+                  lines.append(f"LOG {msg}")
+              outcome = doc.get('outcome')
+              if outcome and outcome != 'ok':
+                  lines.append(f"OUTCOME {outcome}")
+          if not lines:
+              lines = ['(no tail events captured)', raw[-400:], err[-400:]]
+          text = '%0A'.join(str(l).replace('%', '%25')[:500] for l in lines[:10])
+          print(f"::error title=tail::{text}")
+          PY
+          exit 0
