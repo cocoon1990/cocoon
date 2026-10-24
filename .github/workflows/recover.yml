@@ -1,0 +1,90 @@
+# ══════════════════════════════════════════════════════════════
+#  Recovery — تشخیص قطعی + بازگرداندن سرویس
+#
+#  شاهدها:
+#    • ghost-signaling-worker (دیپلوی قدیمی) → 200 تا همین الان
+#    • ghost-rs-probe (دیپلوی امروز ۱۳:۰x)  → 200
+#    • ghost-vless-worker (JS خالص، ۱۵:۲۵)  → 1101
+#    • ghost-streaming-worker (همهٔ دیپلوی‌های امروز) → 1101
+#
+#  این ورک‌فلو دو کار می‌کند:
+#    ۱) یک worker بی‌محتوا (بدون import، بدون binding) می‌سازد؛ اگر آن هم
+#       1101 بدهد، مشکل سمت پلتفرم/حساب است نه کد.
+#    ۲) worker اصلی را به آخرین نسخهٔ سالم (قبل از 5.4.0) برمی‌گرداند تا
+#       /health و /sub دوباره کار کنند.
+# ══════════════════════════════════════════════════════════════
+name: "🚑 Recovery — platform verdict + rollback"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths: [".github/workflows/recover.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      SUBDOMAIN: cocoon-de9
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: "1) Empty worker → is the platform accepting new uploads?"
+        run: |
+          set +e
+          mkdir -p /tmp/empty && cd /tmp/empty
+          printf 'export default { async fetch() { return new Response("empty-ok"); } };\n' > e.mjs
+          printf 'name = "ghost-empty-probe"\nmain = "e.mjs"\ncompatibility_date = "2025-10-01"\nworkers_dev = true\n' > wrangler.toml
+          npx --yes wrangler@latest deploy > deploy.log 2>&1
+          echo "deploy rc=$?"
+          sleep 15
+          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 15 "https://ghost-empty-probe.$SUBDOMAIN.workers.dev/?cb=$GITHUB_RUN_ID")
+          BODY=$(head -c 80 body.txt)
+          echo "empty worker -> HTTP $CODE | $BODY"
+          echo "::notice title=platform verdict::empty worker (no imports, no bindings) returned $CODE — body: $BODY"
+          npx --yes wrangler@latest delete --name ghost-empty-probe --force >/dev/null 2>&1
+
+      - name: "2) Roll the streaming worker back to the last pre-5.4.0 version"
+        working-directory: streaming-worker
+        run: |
+          set +e
+          npx --yes wrangler@latest versions list --name ghost-streaming-worker > /tmp/versions.log 2>&1
+          tail -n 40 /tmp/versions.log
+
+          # نسخه‌ای که «قبل از 5.4.0» ساخته شده = اولین نسخهٔ قبل از
+          # 2026-10-24T10:00Z (زمان انتشار 5.4.0)
+          CUTOFF="2026-10-24T10:00"
+          ID=$(python3 - "$CUTOFF" <<'PY'
+          import re, sys, pathlib
+          cutoff = sys.argv[1]
+          text = pathlib.Path('/tmp/versions.log').read_text(errors='replace')
+          rows = re.findall(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+([0-9T:\-\.Z]+)', text)
+          good = [vid for vid, created in rows if created < cutoff]
+          print(good[0] if good else '')
+          PY
+          )
+          echo "rollback target: ${ID:-<none>}"
+          if [ -n "$ID" ]; then
+            npx --yes wrangler@latest rollback "$ID" --name ghost-streaming-worker > /tmp/rollback.log 2>&1
+            echo "rollback rc=$?"
+            tail -n 5 /tmp/rollback.log
+            sleep 20
+            for attempt in 1 2 3 4; do
+              CODE=$(curl -sS -o /tmp/h.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.$SUBDOMAIN.workers.dev/health?cb=$GITHUB_RUN_ID-$attempt")
+              echo "probe $attempt -> $CODE $(head -c 80 /tmp/h.txt)"
+              [ "$CODE" = "200" ] && break
+              sleep 10
+            done
+            echo "::notice title=rollback::after rollback /health returned $CODE"
+          else
+            echo "::warning title=rollback::no pre-5.4.0 version found"
+          fi
