@@ -16,9 +16,12 @@
  * API خودِ Workers پیاده شد؛ راست فقط کارهایی را می‌کند که در production
  * اثبات‌شده کار می‌کنند.
  */
-import rustWorker from '../build/worker/shim.mjs';
+import * as rustModule from '../build/worker/shim.mjs';
 import { connect } from 'cloudflare:sockets';
 import { createVlessHandler, isVlessPath } from './vless.js';
+
+/** worker-build گاهی default می‌دهد و گاهی namespace — هر دو را بپذیر. */
+const rustWorker = rustModule.default && rustModule.default.fetch ? rustModule.default : rustModule;
 
 /** یک handler ساخته‌شده برای هر env (کش‌شده روی env object). */
 const cache = new WeakMap();

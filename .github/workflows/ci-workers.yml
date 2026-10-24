@@ -162,7 +162,11 @@ jobs:
           head -c 200 /tmp/health.json || true
           tail -n 10 /tmp/dev.log || true
 
-          [ "$CODE" = "200" ] || { echo "::error title=workerd /health::got $CODE"; exit 1; }
+          if [ "$CODE" != "200" ]; then
+            LOG=$(tail -n 25 /tmp/dev.log 2>/dev/null | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | head -c 900)
+            echo "::error title=workerd /health::got $CODE%0A$LOG"
+            exit 1
+          fi
           grep -q '"worker":"ghost-streaming"' /tmp/health.json || { echo "::error title=workerd /health::unexpected body"; exit 1; }
           [ "$VLESS" = "426" ] || [ "$VLESS" = "503" ] || { echo "::error title=workerd /vless::got $VLESS"; exit 1; }
           [ "$SUB" = "200" ] || [ "$SUB" = "503" ] || { echo "::error title=workerd /sub::got $SUB"; exit 1; }

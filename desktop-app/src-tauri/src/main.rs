@@ -114,7 +114,7 @@ fn push_log(logs: &LogBuffer, line: String) {
     }
 }
 
-fn lock_shared(shared: &State<'_, Shared>) -> std::sync::MutexGuard<'_, Runtime> {
+fn lock_shared<'a>(shared: &'a State<'_, Shared>) -> std::sync::MutexGuard<'a, Runtime> {
     match shared.0.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -375,7 +375,10 @@ fn stop_core(app: AppHandle, shared: State<'_, Shared>, logs: State<'_, LogBuffe
     // fallback: هستهٔ قدیمی که کنترل‌پلین ندارد
     guard.kill();
     let elapsed = started.elapsed().as_millis() as u64;
-    push_log(&buffer, "[scp-ghost] core stopped (this build cannot keep the TUN adapter)");
+    push_log(
+        &buffer,
+        "[scp-ghost] core stopped (this build cannot keep the TUN adapter)".to_string(),
+    );
     Ok(status(&app, &guard, elapsed))
 }
 
@@ -389,7 +392,10 @@ fn shutdown_core(app: AppHandle, shared: State<'_, Shared>, logs: State<'_, LogB
         let _ = scrub_write(&path, "# session wiped on exit\n");
     }
     guard.kill();
-    push_log(&buffer, "[scp-ghost] core stopped, TUN adapter destroyed, memory wiped");
+    push_log(
+        &buffer,
+        "[scp-ghost] core stopped, TUN adapter destroyed, memory wiped".to_string(),
+    );
     status(&app, &guard, 0)
 }
 
