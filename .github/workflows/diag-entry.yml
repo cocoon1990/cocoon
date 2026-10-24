@@ -56,7 +56,9 @@ jobs:
 
       - name: Probe every entry shape
         working-directory: streaming-worker
+        shell: bash
         run: |
+          set +e
           set -u
           OUT=/tmp/res.txt; : > "$OUT"
           trap 'MSG=$(sed -e "s/%/%25/g" "$OUT" 2>/dev/null | awk "BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") \$0}" | head -c 900); echo "::error title=entry-shapes::$MSG"' EXIT
@@ -81,7 +83,7 @@ jobs:
           probe() { # $1=label $2=main $3=noflag?
             CFG="wrangler.diag-$1.toml"
             sed -e "s#^main .*#main = \"$2\"#" wrangler.toml > "$CFG" || { echo "$1 | config failed" >> "$OUT"; return 0; }
-            [ "${3:-}" = "noflag" ] && sed -i '/compatibility_flags/d' "$CFG"
+            if [ "${3:-}" = "noflag" ]; then sed -i '/compatibility_flags/d' "$CFG"; fi
             npx --yes wrangler@latest deploy -c "$CFG" > "/tmp/d-$1.log" 2>&1
             RC=$?
             rm -f "$CFG"
@@ -92,7 +94,7 @@ jobs:
               CODE=$(curl -sS -o /tmp/b.txt -w '%{http_code}' --max-time 15 \
                 "$URL/health?cb=$GITHUB_RUN_ID-$1-$attempt" 2>/dev/null || echo 000)
               BODY=$(head -c 120 /tmp/b.txt 2>/dev/null | tr '\n' ' ')
-              [ "$CODE" = "200" ] && break
+              if [ "$CODE" = "200" ]; then break; fi
               sleep 8
             done
             WHY=$(grep -aoE 'ERROR\][^\[]{0,120}' "/tmp/d-$1.log" 2>/dev/null | head -1 | tr -d '\r' | cut -c1-120)
