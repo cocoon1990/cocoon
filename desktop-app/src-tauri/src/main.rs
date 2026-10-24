@@ -39,8 +39,8 @@ const MAX_LOG_LINES: usize = 400;
 // ══════════════════════════════════════════════════════════════
 
 struct CoreProcess {
-    /// با `kill_on_drop(true)` ساخته می‌شود؛ پس Drop همین دسته، فرایند را
-    /// می‌کشد و هیچ meow.exe یتیمی نمی‌ماند.
+    /// مالک فرایند: هر جا این ساختار دور ریخته شود، `kill` صریح صدا زده
+    /// می‌شود تا هیچ meow.exe یتیمی نماند.
     child: CommandChild,
     mode: String,
     config_path: String,
@@ -252,8 +252,7 @@ async fn start_core(
         .shell()
         .sidecar(SIDECAR_NAME)
         .map_err(|e| format!("sidecar «{SIDECAR_NAME}» پیدا نشد: {e}"))?
-        .args(args)
-        .kill_on_drop(true);
+        .args(args);
 
     let (mut rx, child) = command
         .spawn()
@@ -357,9 +356,10 @@ fn main() {
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 if let Some(shared) = app_handle.try_state::<Shared>() {
-                    if let Ok(mut guard) = shared.core.lock() {
-                        // Drop → kill، تا هیچ meow.exe یتیمی نماند
-                        guard.take();
+                    let orphan = shared.core.lock().ok().and_then(|mut guard| guard.take());
+                    if let Some(core) = orphan {
+                        // kill(self) فرایند را می‌کشد و برای خروج صبر می‌کند
+                        let _ = core.child.kill();
                     }
                 }
             }

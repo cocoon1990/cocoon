@@ -208,7 +208,10 @@ def main() -> int:
             "sidecar(SIDECAR_NAME)" in rust or 'sidecar("meow")' in rust,
             "main.rs launches the sidecar",
         )
-        check("kill_on_drop" in rust, "child process is reaped on drop")
+        check(
+            rust.count("child.kill()") >= 1 and "kill_on_drop" not in rust,
+            "child process is killed explicitly (no orphan on exit)",
+        )
 
     # ── هم‌خوانی دستورها ────────────────────────────────────────
     print("== commands ==")
