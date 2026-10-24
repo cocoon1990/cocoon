@@ -199,39 +199,55 @@ jobs:
               print(f"::error title=workerd-run-{i}::{chunk}")
           PY
           exit 0
-      # ── آزمون قاطع: نسخهٔ 5.2.6 (last known good) را دیپلوی کن ──
-      # اگر همان کدِ قبلی هم 1101 بدهد، مشکل از دیف v5.4.0 نیست و
-      # پلتفرم/toolchain است. اگر ۲۰۰ بدهد، هم production برمی‌گردد و
-      # هم مقصر داخل دیف است.
-      - name: Deploy the last known good build (67d7009) and probe
+      # ── شناسایی از سمت API + بازگرداندن last-known-good ────────
+      - name: Inspect deployment via API and redeploy 5.2.6
         if: always()
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          set -uo pipefail
+          set -u
+          OUT=/tmp/inspect.txt
+          : > "$OUT"
+          trap 'python3 - "$OUT" <<"PY"
+          import pathlib, sys
+          lines = [l for l in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines() if l.strip()]
+          body = "%0A".join(l.replace("%", "%25")[:400] for l in lines[:12])
+          print(f"::error title=inspect::{body}")
+          PY' EXIT
+
+          ACC=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                https://api.cloudflare.com/client/v4/accounts \
+              | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['result'][0]['id'] if d.get('result') else '')")
+          echo "account: ${ACC:0:8}" >> "$OUT"
+
+          curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/scripts/ghost-streaming-worker" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin).get('result',{});print('script:',{k:d.get(k) for k in ('handlers','last_deployed_from','usage_model','etag','created_on','modified_on')})" >> "$OUT" 2>&1 || true
+
+          curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/scripts/ghost-streaming-worker/deployments" \
+            | python3 -c "import json,sys;r=json.load(sys.stdin).get('result',{});d=(r.get('deployments') or [{}])[0];print('deployment:',{k:d.get(k) for k in ('id','created_on','source','strategy','status','annotations','versions')})" >> "$OUT" 2>&1 || true
+
+          # بازگرداندن نسخهٔ سالم قبلی (67d7009) کنار همان اسم worker
           R=$(mktemp -d)
-          git worktree add --detach "$R/old" 67d7009231eb10b67ccc8fcf7648b770227d611e >/dev/null 2>&1
-          cd "$R/old/streaming-worker"
-          echo "old version: $(grep -m1 '^version' Cargo.toml)"
-          npx --yes wrangler@latest deploy > /tmp/old_deploy.log 2>&1
-          echo "deploy rc=$?"
-          cp /tmp/old_deploy.log /tmp/probe3.txt
-          sleep 15
-          for i in 1 2 3 4 5 6; do
-            CODE=$(curl -sS -o /tmp/body3.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=old-$GITHUB_RUN_ID-$i" || true)
-            echo "old-build attempt $i -> $CODE" >> /tmp/probe3.txt
-            [ "$CODE" = "200" ] && break
-            sleep 10
-          done
-          head -c 300 /tmp/body3.txt >> /tmp/probe3.txt 2>/dev/null || true
-          python3 - <<'PY'
-          import pathlib
-          report = pathlib.Path('/tmp/probe3.txt').read_text(errors='replace')
-          lines = [l for l in report.splitlines() if l.strip()]
-          text = '%0A'.join(l.replace('%', '%25')[:300] for l in lines[-12:])
-          print(f"::error title=old-build::{text}")
-          PY
+          git -C "$(pwd)/../../../.." rev-parse --short HEAD >> "$OUT" 2>&1 || true
+          git worktree add --detach "$R/old" 67d7009231eb10b67ccc8fcf7648b770227d611e >> "$OUT" 2>&1 || true
+          if [ -d "$R/old/streaming-worker" ]; then
+            cd "$R/old/streaming-worker"
+            npx --yes wrangler@latest deploy >> "$OUT" 2>&1
+            echo "old deploy rc=$?" >> "$OUT"
+            sleep 20
+            for i in 1 2 3 4 5 6; do
+              CODE=$(curl -sS -o /tmp/b3.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=old-$GITHUB_RUN_ID-$i" || true)
+              echo "old attempt $i -> $CODE" >> "$OUT"
+              [ "$CODE" = "200" ] && break
+              sleep 10
+            done
+            head -c 200 /tmp/b3.txt >> "$OUT" 2>/dev/null || true
+          else
+            echo "worktree failed" >> "$OUT"
+          fi
           exit 0
 
       # ── گرفتن استثنای واقعی با wrangler tail ────────────────────
