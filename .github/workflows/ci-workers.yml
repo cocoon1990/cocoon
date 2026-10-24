@@ -286,8 +286,9 @@ jobs:
           ls -l build/worker/ | head -6
           exit 0
 
-      # ══ بایسکت مسیر درخواست: Router یا هندلرها؟ ════════════════════
-      - name: Probe V3 (Router only) + V4 (no Router)
+      # ══ V5: روتینگ واقعی، بدنهٔ هندلرها دست‌نخورده ══════════════════
+      # ══ V6: همان کد با پروفایل ساخت متفاوت ═════════════════════════
+      - name: Probe V5 (real handlers) + V6 (opt-level s / thin LTO)
         if: always()
         continue-on-error: true
         env:
@@ -297,6 +298,7 @@ jobs:
           cd streaming-worker
           OUT=/tmp/v.txt; : > "$OUT"
           cp src/lib.rs /tmp/lib.real.rs
+          cp Cargo.toml /tmp/Cargo.real.toml
 
           deploy_probe() {
             printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n' "$1" > "wrangler.$1.toml"
@@ -307,60 +309,54 @@ jobs:
             sleep 15
             CODE=$(curl -sS -o "/tmp/v-$1.body" -w '%{http_code}' --max-time 15 \
               "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
-            printf '%s: deploy_rc=%s health=%s body=%s\n' "$1" "$RC" "$CODE" \
-              "$(head -c 300 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+            printf '%s: deploy_rc=%s health=%s size=%s body=%s\n' "$1" "$RC" "$CODE" \
+              "$(wc -c < build/worker/shim.wasm 2>/dev/null || echo 0)" \
+              "$(head -c 220 "/tmp/v-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
           }
 
           patch_main() {
             python3 - "$1" <<'PY'
           import pathlib, sys
-          main_rs = sys.argv[1]
           p = pathlib.Path('src/lib.rs')
           lines = p.read_text().splitlines(True)
           start = next(i for i, l in enumerate(lines) if l.startswith('#[event(fetch)]'))
           end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip() == '}')
-          p.write_text(''.join(lines[:start]) + main_rs + ''.join(lines[end + 1:]))
+          p.write_text(''.join(lines[:start]) + sys.argv[1] + ''.join(lines[end + 1:]))
           PY
           }
 
-          V3="#[event(fetch)]
+          V5="#[event(fetch)]
           pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-              let mut s = String::from(\"A\");
-              let p = req.path();
-              s.push('B');
-              let m = req.method().to_string();
-              s.push('C');
-              let v = env.var(\"WORKER_VERSION\").ok().map(|x| x.to_string()).unwrap_or_default();
-              s.push('D');
-              let router = Router::new().get(\"/health\", |_r, _c| Response::ok(\"inner\"));
-              s.push('E');
-              match router.run(req, env).await {
-                  Ok(res) => Response::ok(format!(\"{}|F|{}|{}|{}|{}\", s, p, m, v, res.status_code())),
-                  Err(e) => Response::ok(format!(\"{}|ERR|{}\", s, e.to_string())),
-              }
+              let router = Router::new()
+                  .get_async(\"/stream\", handle_stream)
+                  .get_async(\"/vless\", handle_vless)
+                  .get_async(\"/sub\", handle_subscription)
+                  .get(\"/health\", |_r, c| {
+                      let v = c.var(\"WORKER_VERSION\").map(|x| x.to_string()).unwrap_or_else(|_| \"unknown\".to_string());
+                      Response::ok(format!(\"{{\"status\":\"ok\",\"version\":\"{}\"}}\", v))
+                  });
+              router.run(req, env).await
           }"
 
-          V4="#[event(fetch)]
-          pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-              let path = req.path();
-              if path == \"/health\" {
-                  let v = env.var(\"WORKER_VERSION\").ok().map(|x| x.to_string()).unwrap_or_default();
-                  return Response::ok(format!(\"{{\"status\":\"ok\",\"version\":\"{}\",\"route\":\"manual\"}}\", v));
-              }
-              Response::error(\"not implemented in probe\", 501)
-          }"
-
-          patch_main "$V3"
-          worker-build --release > /tmp/v3-build.log 2>&1 || echo "V3 build FAILED" >> "$OUT"
-          deploy_probe ghost-v3-router
+          patch_main "$V5"
+          worker-build --release > /tmp/v5-build.log 2>&1 || echo "V5 build FAILED" >> "$OUT"
+          deploy_probe ghost-v5-realhandlers
           cp /tmp/lib.real.rs src/lib.rs
 
-          patch_main "$V4"
-          worker-build --release > /tmp/v4-build.log 2>&1 || echo "V4 build FAILED" >> "$OUT"
-          deploy_probe ghost-v4-manual
-          cp /tmp/lib.real.rs src/lib.rs
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('Cargo.toml')
+          s = p.read_text()
+          s = s.replace('opt-level     = "z"', 'opt-level     = "s"')
+          s = s.replace('lto           = "fat"', 'lto           = "thin"')
+          s = s.replace('codegen-units = 1', 'codegen-units = 16')
+          p.write_text(s)
+          PY
+          worker-build --release > /tmp/v6-build.log 2>&1 || echo "V6 build FAILED" >> "$OUT"
+          deploy_probe ghost-v6-profile
+          cp /tmp/Cargo.real.toml Cargo.toml
 
-          grep -ahE '^error' /tmp/v3-build.log /tmp/v4-build.log | head -4 >> "$OUT" || true
+          grep -ahE '^error(\[|:)' /tmp/v5-build.log /tmp/v6-build.log | head -4 >> "$OUT" || true
           rm -f wrangler.ghost-*.toml
           MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-900)
-          echo "::error title=probe-V34::$MSG"
+          echo "::error title=probe-V56::$MSG"
