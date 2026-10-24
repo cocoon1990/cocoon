@@ -5,6 +5,8 @@ behaviour), because the sandbox has no Rust toolchain. Rust syntax is
 validated separately by ci-workers.yml (`cargo check`).
 """
 import base64
+import hashlib
+import hmac as hmaclib
 
 ALLOWED = ["googlevideo.com", "youtube.com", "ytimg.com", "ggpht.com", "googleapis.com"]
 
@@ -222,6 +224,47 @@ assert q["security"] == ["tls"] and q["type"] == ["ws"] and q["encryption"] == [
 assert q["sni"] == ["ghost.example.com"]
 assert q["path"] == ["/vless"]
 print("URI parse (scheme/user/port/params): OK")
+
+print("\nFAILURES (pre-hmac):", fails)
+
+# ── HMAC key derivation (must match browser-wasm) ───────────────
+def verify_hmac(message: str, provided_sig: str, secret: str) -> bool:
+    """پورت خط‌به‌خط verify_hmac_signature پس از رفع باگ کلید."""
+    cleaned = secret.strip()
+    candidates = []
+    try:
+        decoded = bytes.fromhex(cleaned)
+        if decoded:
+            candidates.append(decoded)
+    except ValueError:
+        pass
+    candidates.append(cleaned.encode())
+
+    for key in candidates:
+        expected = hmaclib.new(key, message.encode(), hashlib.sha256).hexdigest()
+        if hmaclib.compare_digest(expected, provided_sig.strip()):
+            return True
+    return False
+
+
+SECRET_HEX = "9f2c4e7a1b8d3506f4c2a9e7d1b8c5a3e6f0d2b9c7a4e1f8d6b3a0c9e5f2d7b4"
+MSG = "https://www.youtube.com/robots.txt:7"
+
+client_sig = hmaclib.new(bytes.fromhex(SECRET_HEX), MSG.encode(), hashlib.sha256).hexdigest()
+legacy_sig = hmaclib.new(SECRET_HEX.encode(), MSG.encode(), hashlib.sha256).hexdigest()
+
+hmac_cases = [
+    ("client hex-decoded key is accepted", verify_hmac(MSG, client_sig, SECRET_HEX), True),
+    ("legacy raw-ascii key still accepted", verify_hmac(MSG, legacy_sig, SECRET_HEX), True),
+    ("tampered signature rejected", verify_hmac(MSG, "00" * 32, SECRET_HEX), False),
+    ("wrong seq rejected", verify_hmac("https://www.youtube.com/robots.txt:8", client_sig, SECRET_HEX), False),
+    ("non-hex secret falls back to raw", verify_hmac(MSG, hmaclib.new(b"passphrase", MSG.encode(), hashlib.sha256).hexdigest(), "passphrase"), True),
+]
+print()
+for name, got, exp in hmac_cases:
+    ok = got == exp
+    fails += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'}  hmac: {name} = {got} (want {exp})")
 
 print("\nFAILURES:", fails)
 raise SystemExit(1 if fails else 0)

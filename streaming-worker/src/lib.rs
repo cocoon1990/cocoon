@@ -449,21 +449,52 @@ fn verify_hmac_signature(message: &str, provided_sig: &str, secret: &str) -> boo
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
-        return false;
+    let sign = |key: &[u8]| -> Option<Vec<u8>> {
+        let mut mac = HmacSha256::new_from_slice(key).ok()?;
+        mac.update(message.as_bytes());
+        Some(mac.finalize().into_bytes().to_vec())
     };
-    mac.update(message.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
 
-    // Constant-time comparison
-    if expected.len() != provided_sig.len() {
+    let cleaned = secret.trim();
+    let provided = provided_sig.trim().as_bytes().to_vec();
+
+    // ⚠️ منبع ناسازگاری نسخه‌های قبل:
+    // کلاینت (browser-wasm) کلید را با hex::decode از hmac_key_hex می‌سازد
+    // (۳۲ بایت باینری)، اما اینجا از secret.as_bytes() استفاده می‌شد
+    // (۶۴ بایت ASCII از خودِ رشتهٔ hex). پیام یکی بود، کلید نه → 403.
+    //
+    // حالا اول همان کلید hex-decoded امتحان می‌شود (سازگار با کلاینت).
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    if let Ok(decoded) = hex::decode(cleaned) {
+        if !decoded.is_empty() {
+            candidates.push(decoded);
+        }
+    }
+    // سازگاری عقب‌رو: کلیدی که به‌صورت متن خام استفاده می‌شد.
+    candidates.push(cleaned.as_bytes().to_vec());
+
+    for (index, key) in candidates.iter().enumerate() {
+        if let Some(expected) = sign(key) {
+            if constant_time_eq(&expected, &provided) {
+                if index > 0 {
+                    console_log!(
+                        "[Ghost Streaming] accepted a legacy raw-key HMAC; HMAC_SECRET should be hex-encoded"
+                    );
+                }
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// مقایسهٔ constant-time — طول‌ها هم پوشش داده می‌شوند
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
         return false;
     }
-    expected
-        .bytes()
-        .zip(provided_sig.bytes())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ══════════════════════════════════════════════════════════════
