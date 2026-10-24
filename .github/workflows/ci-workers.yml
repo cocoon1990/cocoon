@@ -121,3 +121,228 @@ jobs:
           echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           cat "$RUNNER_TEMP/trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  # ── اجرای واقعی در workerd (بدون deploy) ───────────────────────
+  # اگر worker در Mainnet با 1101 می‌میرد، اینجا استثنای واقعی چاپ
+  # می‌شود. عمداً فقط برای streaming-worker و فقط روی PR.
+  preview:
+    name: "🔬 Local workerd run (streaming-worker)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "streaming-worker -> target"
+          key: "preview"
+
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.7 --locked
+
+      - name: Build streaming-worker
+        working-directory: streaming-worker
+        run: worker-build --release
+
+      - name: Run it in workerd and capture the exception
+        run: |
+          set -uo pipefail
+          cd streaming-worker
+
+          echo "npx wrangler@latest --version"; npx --yes wrangler@latest --version || true
+
+          echo "--- build/worker ---"; ls -l build/worker/ || true
+          npx --yes wrangler@latest deploy --dry-run --outdir /tmp/dry > /tmp/dry.log 2>&1 || true
+          echo "--- dry-run tail ---"; tail -n 25 /tmp/dry.log || true
+          echo "--- dry out ---"; ls -l /tmp/dry || true
+
+          npx --yes wrangler@latest dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
+          DEVPID=$!
+          CODES=""
+          for i in $(seq 1 25); do
+            sleep 2
+            CODE=$(curl -sS -o /tmp/body.txt -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/health || true)
+            CODES="$CODES $CODE"
+            echo "attempt $i -> $CODE"
+            [ "$CODE" = "200" ] && break
+          done
+          kill $DEVPID 2>/dev/null || true
+          sleep 1
+
+          {
+            echo "codes:$CODES"
+            echo "--- body ---"; head -c 600 /tmp/body.txt 2>/dev/null || true
+            echo "--- build/worker ---"; ls -l build/worker 2>/dev/null || true
+            echo "--- dry-run summary ---"; grep -E 'Total Upload|Your Worker has access|Total' /tmp/dry.log 2>/dev/null || tail -n 12 /tmp/dry.log 2>/dev/null || true
+            echo "--- dev.log (last 20) ---"; tail -n 20 /tmp/dev.log 2>/dev/null || true
+          } > /tmp/report.txt
+
+          python3 - <<'PY'
+          import pathlib
+          report = pathlib.Path('/tmp/report.txt').read_text(errors='replace')
+          chunks = []
+          cur = ''
+          for line in report.splitlines():
+              if len(cur) + len(line) > 900:
+                  chunks.append(cur); cur = ''
+              cur += line + '%0A'
+          if cur: chunks.append(cur)
+          for i, chunk in enumerate(chunks[:8]):
+              chunk = chunk.replace('%', '%25').replace('%250A', '%0A')
+              print(f"::error title=workerd-run-{i}::{chunk}")
+          PY
+          exit 0
+      # ── دیپلوی همین build + probe (حلقهٔ تشخیص سریع) ───────────
+      - name: Deploy this build and probe production
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          OUT=/tmp/probe.txt
+          : > "$OUT"
+          trap 'python3 - "$OUT" <<"PY"
+          import pathlib, sys
+          lines = [l for l in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines() if l.strip()]
+          body = "%0A".join(l.replace("%", "%25")[:300] for l in lines[-10:])
+          print(f"::error title=probe::{body}")
+          PY' EXIT
+
+          cd streaming-worker
+          npx --yes wrangler@latest deploy >> "$OUT" 2>&1
+          echo "deploy rc=$?" >> "$OUT"
+          sleep 20
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -o /tmp/b.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID-$i" || true)
+            echo "probe $i -> $CODE" >> "$OUT"
+            [ "$CODE" = "200" ] && break
+            sleep 10
+          done
+          head -c 200 /tmp/b.txt >> "$OUT" 2>/dev/null || true
+          exit 0
+
+      # ══ پروب ماتریسی: محیط سالم است یا artifact؟ ═════════════════
+      # ۱) یک worker خالص JS: اگر این هم 1101 بدهد → مشکل حساب/لبه است.
+      - name: Probe A — minimal JS worker (environment sanity)
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          mkdir -p /tmp/jsprobe && cd /tmp/jsprobe
+          printf 'export default { async fetch() { return new Response("js-ok"); } };\n' > probe.mjs
+          printf 'name = "ghost-js-probe"\nmain = "probe.mjs"\ncompatibility_date = "2025-10-01"\nworkers_dev = true\n' > wrangler.toml
+          npx --yes wrangler@latest deploy > deploy.log 2>&1
+          echo "deploy rc=$?" >> deploy.log
+          sleep 25
+          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 15 "https://ghost-js-probe.cocoon-de9.workers.dev/?cb=$GITHUB_RUN_ID" || true)
+          MSG="A js-probe -> HTTP $CODE | body=$(head -c 80 body.txt | tr '\n' ' ')%0Adeploy: $(tail -n 4 deploy.log | tr '\n' ' ' | cut -c1-260)"
+          echo "::error title=probe-A-js::$MSG"
+
+      # ۲) مینیمال‌ترین worker ممکن با همان toolchain راست (همان worker 0.8.7).
+      #    اگر این سالم باشد، کد برنامه مقصر است، نه ابزار.
+      - name: Probe B — minimal Rust worker (same toolchain)
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          mkdir -p /tmp/rsprobe/src && cd /tmp/rsprobe
+          printf '[package]\nname = "rsprobe"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\nworker = { version = "0.8.7" }\n\n[profile.release]\nopt-level = "z"\nlto = "fat"\ncodegen-units = 1\npanic = "abort"\n' > Cargo.toml
+          printf 'use worker::*;\n\n#[event(fetch)]\npub async fn main(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n    Response::ok("rs-ok")\n}\n' > src/lib.rs
+          printf 'name = "ghost-rs-probe"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n\n[build]\ncommand = "worker-build --release"\n' > wrangler.toml
+          worker-build --release > build.log 2>&1
+          echo "build rc=$? size=$(wc -c < build/worker/shim.wasm 2>/dev/null || echo 0)" >> build.log
+          npx --yes wrangler@latest deploy >> build.log 2>&1
+          echo "deploy rc=$?" >> build.log
+          sleep 25
+          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 15 "https://ghost-rs-probe.cocoon-de9.workers.dev/?cb=$GITHUB_RUN_ID" || true)
+          MSG="B rs-probe -> HTTP $CODE | body=$(head -c 80 body.txt | tr '\n' ' ')%0A$(grep -E 'build rc|deploy rc|error' build.log | tail -n 3 | tr '\n' ' ' | cut -c1-240)"
+          echo "::error title=probe-B-rust::$MSG"
+
+      # ══ چه ماژول‌هایی import می‌شوند؟ ═════════════════════════════
+      - name: Dump bundle imports
+        if: always()
+        continue-on-error: true
+        run: |
+          set -u
+          cd streaming-worker
+          npx --yes wrangler@latest deploy --dry-run --outdir /tmp/dry >/dev/null 2>&1 || true
+          echo "--- shim.mjs imports ---"
+          grep -oE 'from ?"[^"]+"' build/worker/shim.mjs 2>/dev/null | sort -u || echo none
+          echo "--- bundle imports ---"
+          grep -ohE 'from ?"[^":]+:[^"]+"' /tmp/dry/*.js 2>/dev/null | sort -u || echo none
+          echo "--- files ---"
+          ls -l build/worker/ | head -6
+          exit 0
+
+      # ══ کدام هندلر بودجهٔ ماژول را می‌شکند؟ ══════════════════════════
+      - name: Probe S1 (stream) / S2 (sub) / S3 (vless)
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          cd streaming-worker
+          OUT=/tmp/s.txt; : > "$OUT"
+          cp src/lib.rs /tmp/lib.real.rs
+
+          deploy_probe() {
+            printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n' "$1" > "wrangler.$1.toml"
+            set +e
+            npx --yes wrangler@latest deploy -c "wrangler.$1.toml" > "/tmp/s-$1.log" 2>&1
+            RC=$?
+            set -e
+            sleep 15
+            CODE=$(curl -sS -o "/tmp/s-$1.body" -w '%{http_code}' --max-time 15 \
+              "https://$1.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
+            W=$(find build -name '*.wasm' -exec wc -c {} \; 2>/dev/null | awk '{s+=$1} END {print s+0}')
+            printf '%s: rc=%s health=%s wasm=%s body=%s\n' "$1" "$RC" "$CODE" "$W" \
+              "$(head -c 160 "/tmp/s-$1.body" 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+          }
+
+          patch_main() {
+            python3 - "$1" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('src/lib.rs')
+          lines = p.read_text().splitlines(True)
+          start = next(i for i, l in enumerate(lines) if l.startswith('#[event(fetch)]'))
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip() == '}')
+          p.write_text(''.join(lines[:start]) + sys.argv[1] + ''.join(lines[end + 1:]))
+          PY
+          }
+
+          mk_main() { # $1 = route-path, $2 = handler
+            printf '#[event(fetch)]\npub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {\n    let router = Router::new()\n        .get_async("%s", %s)\n        .get("/health", |_r, _c| Response::ok("ok"));\n    router.run(req, env).await\n}\n' "$1" "$2"
+          }
+
+          patch_main "$(mk_main /stream handle_stream)"
+          worker-build --release > /tmp/s1.log 2>&1 || echo "S1 build FAILED" >> "$OUT"
+          deploy_probe ghost-s1-stream
+          cp /tmp/lib.real.rs src/lib.rs
+
+          patch_main "$(mk_main /sub handle_subscription)"
+          worker-build --release > /tmp/s2.log 2>&1 || echo "S2 build FAILED" >> "$OUT"
+          deploy_probe ghost-s2-sub
+          cp /tmp/lib.real.rs src/lib.rs
+
+          patch_main "$(mk_main /vless handle_vless)"
+          worker-build --release > /tmp/s3.log 2>&1 || echo "S3 build FAILED" >> "$OUT"
+          deploy_probe ghost-s3-vless
+          cp /tmp/lib.real.rs src/lib.rs
+
+          grep -ahE '^error(\[|:)' /tmp/s1.log /tmp/s2.log /tmp/s3.log | head -4 >> "$OUT" || true
+          rm -f wrangler.ghost-*.toml
+          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-900)
+          echo "::error title=probe-S123::$MSG"
