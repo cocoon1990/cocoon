@@ -804,77 +804,18 @@ async fn pipe_vless(ws: WebSocket, expected_uuid: [u8; 16]) {
         }
     };
 
-    // ── اتصال واقعی به مقصد از داخل Cloudflare ───────────────
-    let socket = match Socket::builder().connect(addr.clone(), port) {
-        Ok(socket) => socket,
-        Err(err) => {
-            console_log!("[Ghost VLESS] connect({}:{}) failed: {:?}", addr, port, err);
-            ws_close(&ws, 1011, "connect failed");
-            return;
-        }
-    };
-
-    if let Err(err) = socket.opened().await {
-        console_log!("[Ghost VLESS] opened() failed: {:?}", err);
-        ws_close(&ws, 1011, "connect failed");
-        return;
-    }
-
-    // پاسخ VLESS v0
-    if ws.send_with_bytes([VLESS_VERSION, 0u8]).is_err() {
-        return;
-    }
-
-    // ── پمپ دوطرفه ────────────────────────────────────────────
-    // split باعث می‌شود دو جهت، دو مالک جدا داشته باشند و borrow checker
-    // بهانه‌ای برای رد کردن select نداشته باشد.
-    let (mut reader, mut writer) = tokio::io::split(socket);
-
-    // بایت‌هایی از payload که همراه هدر آمده بودند
-    if let Some(rest) = buffer.get(consumed..) {
-        if !rest.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            if writer.write_all(rest).await.is_err() {
-                ws_close(&ws, 1011, "write failed");
-                return;
-            }
-        }
-    }
-
-    let upstream = async {
-        use tokio::io::AsyncWriteExt;
-        while let Some(Ok(WebsocketEvent::Message(message))) = events.next().await {
-            match message.bytes() {
-                Some(bytes) if !bytes.is_empty() => {
-                    if writer.write_all(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        let _ = writer.shutdown().await;
-    };
-
-    let downstream = async {
-        use tokio::io::AsyncReadExt;
-        let mut chunk = vec![0u8; VLESS_PIPE_BUF];
-        loop {
-            match reader.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if ws.send_with_bytes(&chunk[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    };
-
-    futures_util::future::select(Box::pin(upstream), Box::pin(downstream)).await;
-
-    ws_close(&ws, 1000, "done");
+    // ⚠️ BISECT (v5.4.1): فراخوانی `cloudflare:sockets` موقتاً حذف شده است تا
+    // مشخص شود کدام بخش باعث Error 1101 روی همهٔ مسیرها (حتی /health) شده.
+    // اگر /health با این نسخه ۲۰۰ شود، یعنی import ماژول sockets در زمان
+    // instantiate مشکل ایجاد می‌کند و باید با import پویا (js shim) جایگزین شود.
+    console_log!(
+        "[Ghost VLESS] header ok ({}:{}, payload {} bytes) — sockets disabled in this build",
+        addr,
+        port,
+        buffer.len().saturating_sub(consumed)
+    );
+    let _ = (port, consumed);
+    ws_close(&ws, 1011, "outbound sockets disabled in this build");
 }
 
 async fn handle_vless(req: Request, ctx: RouteContext<()>) -> Result<Response> {
