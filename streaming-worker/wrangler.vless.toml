@@ -1,0 +1,21 @@
+# ══════════════════════════════════════════════════════════════
+#  ghost-vless-worker — سرور VLESS فقط-JS (بدون wasm، بدون binding)
+#
+#  چرا جدا از ghost-streaming-worker؟
+#  هر ماژولی که کد WebSocket را داخل wasm داشته باشد روی Mainnet با
+#  1101 می‌میرد (با هر config/binding/profile). این worker هیچ wasm ای
+#  ندارد؛ فقط `WebSocketPair` + `cloudflare:sockets`.
+#
+#  دیپلوی:
+#    wrangler deploy -c wrangler.vless.toml
+#  secret لازم:
+#    VLESS_UUID   (یا var در [vars] زیر)
+# ══════════════════════════════════════════════════════════════
+name               = "ghost-vless-worker"
+main               = "src/vless-entry.mjs"
+compatibility_date = "2025-10-01"
+workers_dev        = true
+
+[vars]
+# مسیر WebSocket (قابل تغییر). /vless همیشه کار می‌کند.
+VLESS_PATH = "/vless"
