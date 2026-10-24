@@ -158,6 +158,11 @@ jobs:
 
           echo "npx wrangler@latest --version"; npx --yes wrangler@latest --version || true
 
+          echo "--- build/worker ---"; ls -l build/worker/ || true
+          npx --yes wrangler@latest deploy --dry-run --outdir /tmp/dry > /tmp/dry.log 2>&1 || true
+          echo "--- dry-run tail ---"; tail -n 25 /tmp/dry.log || true
+          echo "--- dry out ---"; ls -l /tmp/dry || true
+
           npx --yes wrangler@latest dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
           DEVPID=$!
           CODES=""
