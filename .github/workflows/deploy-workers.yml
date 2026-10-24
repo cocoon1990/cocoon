@@ -259,15 +259,23 @@ jobs:
       # صفر wasm، صفر binding: فقط WebSocketPair + cloudflare:sockets.
       # همان UUID مشتق‌شده تا کلید دو worker یکی باشد.
       - name: Deploy the JS VLESS worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          command: deploy -c wrangler.vless.toml
-          workingDirectory: streaming-worker
-          secrets: |
-            VLESS_UUID
+        working-directory: streaming-worker
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           VLESS_UUID: ${{ steps.vless.outputs.uuid }}
+        run: |
+          set -u
+          if ! npx --yes wrangler@latest deploy -c wrangler.vless.toml > /tmp/vless-deploy.log 2>&1; then
+            MSG=$(grep -aoE 'ERROR\][^\[]{0,200}' /tmp/vless-deploy.log | head -2 | tr '\n' ' ' | cut -c1-500)
+            MSG2=$(sed -e 's/%/%25/g' "$MSG" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
+            echo "::error title=VLESS worker deploy::$MSG2"
+            tail -n 15 /tmp/vless-deploy.log
+            exit 1
+          fi
+          tail -n 12 /tmp/vless-deploy.log
+          printf '%s' "$VLESS_UUID" | npx --yes wrangler@latest secret put VLESS_UUID -c wrangler.vless.toml >/dev/null 2>&1 \
+            || echo "::warning title=VLESS secret::could not set VLESS_UUID"
+          echo "✅ ghost-vless-worker deployed"
 
       # ── Health Check بعد از Deploy ─────────────────────────
       - name: Post-deploy health check
