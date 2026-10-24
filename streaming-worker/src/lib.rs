@@ -449,10 +449,12 @@ fn verify_hmac_signature(message: &str, provided_sig: &str, secret: &str) -> boo
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
+    // خروجی باید hex باشد، نه بایت خام: مقدار ارسالی از کلاینت یک رشتهٔ
+    // hex ۶۴ کاراکتری است، پس هر دو طرف باید هم‌شکل مقایسه شوند.
     let sign = |key: &[u8]| -> Option<Vec<u8>> {
         let mut mac = HmacSha256::new_from_slice(key).ok()?;
         mac.update(message.as_bytes());
-        Some(mac.finalize().into_bytes().to_vec())
+        Some(hex::encode(mac.finalize().into_bytes()).into_bytes())
     };
 
     let cleaned = secret.trim();
