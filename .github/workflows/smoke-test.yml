@@ -75,6 +75,12 @@ jobs:
           grep -q '"worker":"ghost-streaming"' body.json || { echo "::error::/health body is not the streaming worker"; exit 1; }
           grep -q '"version"' body.json || { echo "::error::/health has no version field"; exit 1; }
 
+          # نسخهٔ مستقر باید دقیقاً همان نسخهٔ Cargo.toml باشد — جلوگیری از drift
+          EXPECTED=$(grep -m1 '^version' streaming-worker/Cargo.toml | cut -d'"' -f2)
+          python3 -c 'import json,sys; sys.exit(0 if json.load(open("body.json")).get("version")==sys.argv[1] else 1)' "$EXPECTED" \
+            || { echo "::error::deployed /health version != Cargo.toml ($EXPECTED)"; exit 1; }
+          echo "deployed version: v$EXPECTED"
+
       # ── ۲. /sub — وجود مسیر و دروازهٔ امنیتی ────────────────
       - name: "Sub: route exists and is gated (X-Ghost-Sub)"
         run: |
