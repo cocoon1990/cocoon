@@ -21,9 +21,9 @@
 //
 //  import() پویا روی ServiceWorkerGlobalScope طبق مشخصات مسدود است؛
 //  حتی در یک Module Service Worker هم باید از import ایستا استفاده کرد.
-//  ?v=5.2.0 همچنین کشِ نسخه‌های قبلی را دور می‌زند.
+//  ?v=5.2.1 همچنین کشِ نسخه‌های قبلی را دور می‌زند.
 // ──────────────────────────────────────────────────────────────
-import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.2.0";
+import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.2.1";
 
 // ──────────────────────────────────────────────────────────────
 //  Endpoint URLs — توسط deploy-pages.yml در زمان build inject می‌شوند
@@ -34,9 +34,9 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 //  Constants
 // ──────────────────────────────────────────────────────────────
-const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.2.0"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
+const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.2.1"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.2.0";   // 5.2.0: test-tunnel در UI + import ایستا
+const SW_VERSION        = "5.2.1";   // 5.2.1: CORS روی /stream + خطاهای خوانا در SW
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
@@ -330,19 +330,60 @@ async function fetchRoutingConfig() {
 }
 
 // ──────────────────────────────────────────────────────────────
+//  خطاها همیشه باید به UI برسند
+//
+//  چرا `return fetch(request)` خطرناک بود: اگر آن fetch رد شود
+//  (مثلاً مقصد هدر CORS ندارد)، پرامیسِ ردشده مستقیم به respondWith
+//  می‌رسد و مرورگر به صفحه «TypeError: Failed to fetch» می‌دهد —
+//  بدون هیچ توضیحی. الان هر خطا به یک Response خوانا تبدیل می‌شود.
+// ──────────────────────────────────────────────────────────────
+function syntheticError(status, message, ghostPath) {
+  // Response بدنه‌دار نمی‌تواند 204/205/304 باشد
+  const bodyForbidden = status === 204 || status === 205 || status === 304;
+  const safeStatus =
+    !bodyForbidden && Number.isInteger(status) && status >= 400 && status <= 599
+      ? status
+      : 502;
+
+  return new Response(message, {
+    status: safeStatus,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Ghost-Path": ghostPath,
+      "X-Ghost-Error": "1",
+    },
+  });
+}
+
+async function safePassthrough(request, stage) {
+  try {
+    return await fetch(request);
+  } catch (err) {
+    console.error(`[Ghost SW] pass-through failed (${stage}):`, err);
+    return syntheticError(
+      502,
+      `Pass-through failed (${stage}): ${err?.message || err}. ` +
+        `The request was NOT proxied through the streaming worker.`,
+      "passthrough-error"
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
 //  Core: مدیریت Fetch — تصمیم‌گیری routing
 // ──────────────────────────────────────────────────────────────
 async function handleFetch(request) {
-  // اگر سیستم آماده نیست، مستقیم pass-through کن
+  // اگر سیستم آماده نیست، pass-through کن (ولی هرگز خطای مبهم نده)
   if (!routerReady || !wasmModule) {
     console.warn("[Ghost SW] Router not ready — pass-through");
-    return fetch(request);
+    return safePassthrough(request, "router-not-ready");
   }
 
   // اگر Session وجود ندارد، نمی‌توانیم HMAC بسازیم
   if (!session) {
     console.warn("[Ghost SW] No active session — pass-through");
-    return fetch(request);
+    return safePassthrough(request, "no-session");
   }
 
   const url = request.url;
@@ -357,71 +398,108 @@ async function handleFetch(request) {
     console.debug(`[Ghost SW] Route decision for ${url}:`, decision.matched_rule, "→", decision.backend);
 
     if (decision.is_denied) {
-      return new Response(
-        JSON.stringify({ error: decision.deny_message, url }),
-        { status: 403, headers: { "Content-Type": "application/json" } }
+      return syntheticError(
+        403,
+        `Denied by routing rule: ${decision.deny_message || "no reason given"}`,
+        "denied"
       );
     }
 
+    // ⚠️ await اجباری است: بدون آن، رد شدن پرامیس از این catch فرار
+    // می‌کند و به respondWith می‌رسد → «Failed to fetch» در UI.
     switch (decision.backend) {
       case "cloudflare-stream-worker":
-        return handleStreamingRequest(request, decision);
+        return await handleStreamingRequest(request, decision);
 
       case "cloudflare-signaling-worker":
-        return fetch(request); // signaling را مستقیم می‌فرستیم
+        return await safePassthrough(request, "signaling");
 
       default:
         console.warn("[Ghost SW] Unknown backend:", decision.backend);
-        return fetch(request);
+        return await safePassthrough(request, "unknown-backend");
     }
 
   } catch (err) {
     console.error("[Ghost SW] Routing error:", err);
-    // در صورت خطا، pass-through (graceful degradation)
-    return fetch(request);
+    // قبلاً اینجا pass-through می‌شد: درخواست بی‌صدا از تونل دور می‌زد
+    // و کاربر فقط «Failed to fetch» می‌دید. حالا علت صریح است.
+    return syntheticError(502, `Routing error: ${err?.message || err}`, "routing-error");
   }
 }
 
 // ──────────────────────────────────────────────────────────────
-//  Streaming Path — ویدیو → Cloudflare Worker (ReadableStream)
+//  Streaming Path — از طریق Cloudflare Worker (ReadableStream)
 // ──────────────────────────────────────────────────────────────
 async function handleStreamingRequest(request, decision) {
+  // ۱) ساخت HMAC-signed URL توسط PhantomSession در Wasm
+  let signedUrl;
   try {
-    // ساخت HMAC-signed URL توسط PhantomSession در Wasm
-    const signedUrl = session.build_stream_url(request.url);
+    signedUrl = session.build_stream_url(request.url);
+  } catch (err) {
+    console.error("[Ghost SW] signing failed:", err);
+    return syntheticError(500, `Signature error: ${err?.message || err}`, "sign-error");
+  }
 
-    // انتقال Range header برای DASH segment support
-    const headers = {};
-    const rangeHeader = request.headers.get("Range");
-    if (rangeHeader) {
-      headers["Range"] = rangeHeader;
-    }
+  const headers = {};
+  const rangeHeader = request.headers.get("Range");
+  if (rangeHeader) {
+    headers["Range"] = rangeHeader;
+  }
 
-    const streamResp = await fetch(signedUrl, {
+  // ۲) درخواست به streaming-worker
+  let streamResp;
+  try {
+    streamResp = await fetch(signedUrl, {
       method: "GET",
       headers,
+      mode: "cors",
+      cache: "no-store",
     });
+  } catch (err) {
+    // TypeError → معمولاً CORS یا قطعی شبکه؛ status در دسترس نیست
+    console.error("[Ghost SW] streaming worker unreachable:", err);
+    return syntheticError(
+      502,
+      `Cannot reach the streaming worker (${err?.name || "Error"}: ${err?.message || err}). ` +
+        `Most likely the worker response has no Access-Control-Allow-Origin header, or the network blocked the request.`,
+      "network-error"
+    );
+  }
 
-    if (!streamResp.ok && streamResp.status !== 206) {
-      throw new Error(`Streaming Worker returned HTTP ${streamResp.status}`);
+  // ۳) خطای worker → status واقعی + پیام خوانا (نه 502 عمومی)
+  if (!streamResp.ok && streamResp.status !== 206) {
+    let detail = "";
+    try {
+      detail = (await streamResp.text()).trim().slice(0, 300);
+    } catch (_) {
+      detail = "";
     }
 
-    // بازگرداندن ReadableStream مستقیم به مرورگر
-    // هیچ buffer‌ای در Service Worker نگه داشته نمی‌شود
-    return new Response(streamResp.body, {
-      status: streamResp.status,
-      headers: {
-        "Content-Type": streamResp.headers.get("Content-Type") || "video/mp4",
-        "Content-Range": streamResp.headers.get("Content-Range") || "",
-        "Accept-Ranges": "bytes",
-        "X-Ghost-Path": "streaming",
-      },
-    });
-
-  } catch (err) {
-    console.error("[Ghost SW] Streaming error:", err);
-    return new Response("Streaming Error", { status: 502 });
+    console.error(`[Ghost SW] Worker rejected the request: HTTP ${streamResp.status}`, detail);
+    return syntheticError(
+      streamResp.status,
+      `Worker returned ${streamResp.status}${detail ? `: ${detail}` : ""}`,
+      "streaming-error"
+    );
   }
+
+  // ۴) مسیر موفق — بدون buffer کردن بدنه
+  const outHeaders = {
+    "Content-Type": streamResp.headers.get("Content-Type") || "video/mp4",
+    "Accept-Ranges": "bytes",
+    "X-Ghost-Path": "streaming",
+  };
+  const contentRange = streamResp.headers.get("Content-Range");
+  if (contentRange) {
+    outHeaders["Content-Range"] = contentRange;
+  }
+
+  const okStatus =
+    streamResp.status === 204 || streamResp.status === 205 || streamResp.status === 304
+      ? 200
+      : streamResp.status;
+
+  return new Response(streamResp.body, { status: okStatus, headers: outHeaders });
 }
 
 // ──────────────────────────────────────────────────────────────

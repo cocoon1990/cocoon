@@ -114,9 +114,30 @@ jobs:
       # ── ۳. /stream بدون پارامتر → 400 (نه 500) ─────────────
       - name: "Stream: missing params → 400"
         run: |
-          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream" || echo 000)
+          CODE=$(curl -sS -D h400.txt -o body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream" || echo 000)
           echo "status=$CODE"
           [ "$CODE" = "400" ] || { echo "::error::expected 400 for missing params, got $CODE"; exit 1; }
+
+      # ── ۳ب. CORS روی پاسخ خطا — بدون آن مرورگر «Failed to fetch» می‌دهد ──
+      - name: "CORS: 400 response carries Access-Control-Allow-Origin"
+        run: |
+          if ! grep -qi '^access-control-allow-origin: *\*' h400.txt; then
+            echo "::error::/stream 400 is missing Access-Control-Allow-Origin"
+            cat h400.txt || true
+            exit 1
+          fi
+          grep -qi '^vary: *origin' h400.txt || { echo "::error::missing Vary: Origin"; exit 1; }
+          echo "✅ 400 is CORS-readable by the browser"
+
+      # ── ۳ج. preflight برای OPTIONS ────────────────────────
+      - name: "CORS: OPTIONS /stream → 204 + allow headers"
+        run: |
+          CODE=$(curl -sS -X OPTIONS -D hopt.txt -o /dev/null -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream" || echo 000)
+          echo "status=$CODE"
+          [ "$CODE" = "204" ] || { echo "::error::expected 204 preflight, got $CODE"; exit 1; }
+          grep -qi '^access-control-allow-origin: *\*' hopt.txt || { echo "::error::preflight lacks ACAO"; exit 1; }
+          grep -qi '^access-control-allow-methods:' hopt.txt || { echo "::error::preflight lacks Allow-Methods"; exit 1; }
+          echo "✅ OPTIONS preflight is handled before the router"
 
       # ── ۴. SSRF — هدف غیرمجاز باید رد شود ──────────────────
       - name: "Security: SSRF target containing an allowlisted hostname is rejected"
@@ -124,12 +145,15 @@ jobs:
         run: |
           TARGET='https://example.com/?probe=googlevideo.com'
           QS=$(python3 -c 'import hashlib,hmac,os,sys,urllib.parse; t=sys.argv[1]; s="0"; sig=hmac.new(os.environ["HMAC_SECRET"].encode(), (t+":"+s).encode(), hashlib.sha256).hexdigest(); print("target="+urllib.parse.quote(t,safe="")+"&sig="+sig+"&seq="+s)' "$TARGET")
-          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream?$QS" || echo 000)
+          CODE=$(curl -sS -D h403.txt -o body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream?$QS" || echo 000)
           echo "status=$CODE"
           cat body.txt 2>/dev/null || true
           echo
           [ "$CODE" = "403" ] || { echo "::error::SSRF guard failed — expected 403, got $CODE"; exit 1; }
+          grep -qi '^access-control-allow-origin: *\*' h403.txt \
+            || { echo "::error::/stream 403 is missing Access-Control-Allow-Origin (SW would see a network error)"; exit 1; }
           echo "✅ hostname allowlist is anchored to the real host (no substring bypass)"
+          echo "✅ 403 is CORS-readable by the browser"
 
       # ── ۵. رگرسیون — هدف مجاز نباید بلاک شود ───────────────
       - name: "Regression: allowlisted target still passes the guard"
