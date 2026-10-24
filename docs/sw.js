@@ -17,6 +17,15 @@
  */
 
 // ──────────────────────────────────────────────────────────────
+//  Static Wasm glue import
+//
+//  import() پویا روی ServiceWorkerGlobalScope طبق مشخصات مسدود است؛
+//  حتی در یک Module Service Worker هم باید از import ایستا استفاده کرد.
+//  ?v=5.1.4 همچنین کشِ شکستِ import پویای نسخه قبل را دور میزند.
+// ──────────────────────────────────────────────────────────────
+import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.1.4";
+
+// ──────────────────────────────────────────────────────────────
 //  Endpoint URLs — توسط deploy-pages.yml در زمان build inject می‌شوند
 // ──────────────────────────────────────────────────────────────
 const STREAMING_WORKER_URL = "__CF_STREAMING_URL__";
@@ -25,9 +34,9 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 //  Constants
 // ──────────────────────────────────────────────────────────────
-const WASM_MODULE_PATH = "./wasm/ghost_wasm.js";
+const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.1.4"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.1.3";   // 5.1.3: broadcast قابل اعتماد + خطاهای صریح Wasm
+const SW_VERSION        = "5.1.4";   // 5.1.4: جایگزینی import پویا با import ایستا
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
@@ -169,7 +178,7 @@ async function initializeGhostSystem({ force = false } = {}) {
   initPromise = (async () => {
     console.log("[Ghost SW] Initializing Ghost system...");
 
-    // ── Step 1: Import و Init Wasm Module ──────────────────
+    // ── Step 1: Init ماژول Wasm ایستا  ──────────────────────
     const wasmLoaded = await loadWasmModule();
     if (!wasmLoaded) {
       return;
@@ -225,21 +234,21 @@ async function initializeGhostSystem({ force = false } = {}) {
 async function loadWasmModule() {
   try {
     if (!wasmModule) {
-      console.log(`[Ghost SW] Importing Wasm module: ${WASM_MODULE_PATH}`);
-      const { default: init, ...exports } = await import(WASM_MODULE_PATH);
+      console.log(`[Ghost SW] Initializing statically imported Wasm module: ${WASM_MODULE_PATH}`);
 
-      if (typeof init !== "function") {
+      if (typeof initWasm !== "function") {
         throw new TypeError("Wasm module has no default init() export");
       }
 
-      await init(); // Wasm binary را لود می‌کند
-      wasmModule = exports;
+      // ماژول glue قبلاً بهصورت ایستا import شده؛ اینجا فقط باینری را لود میکند.
+      await initWasm();
+      wasmModule = ghostWasm;
     }
 
     wasmReady = true;
     console.log("[Ghost SW] ✅ Wasm module loaded");
 
-    // clients.matchAll شامل تب‌های uncontrolled هم باشد؛ در first-load ممکن
+    // clients.matchAll شامل تبهای uncontrolled هم باشد؛ در first-load ممکن
     // است claim هنوز در حال اعمال شدن باشد. UI listener از قبل ثبت شده است.
     await notifyClients({ type: "WASM_READY", version: SW_VERSION });
     return true;
@@ -248,9 +257,9 @@ async function loadWasmModule() {
     wasmReady = false;
     routerReady = false;
 
-    // خطای دقیق (مسیر ماژول + exception) در DevTools دیده شود.
+    // خطای دقیق (مسیر ماژول + exception) در DevTools و UI دیده شود.
     console.error(
-      `[Ghost SW] ❌ Wasm import/initialization failed (${WASM_MODULE_PATH}):`,
+      `[Ghost SW] ❌ Wasm module initialization failed (${WASM_MODULE_PATH}):`,
       err
     );
     await notifyClients({
