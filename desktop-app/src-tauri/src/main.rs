@@ -1,302 +1,174 @@
-// جلوگیری از باز شدن پنجرهٔ کنسول در نسخهٔ release ویندوز
+//! SCP-GHOST desktop shell.
+//!
+//! This binary is deliberately thin: it is a **controller**, not a proxy.
+//! All networking is delegated to the battle-tested `meow` core (mihomo
+//! compatible) which ships next to the executable as a Tauri sidecar.
+//!
+//! Responsibilities:
+//!   * write the generated YAML to the app data directory
+//!   * start / stop the sidecar and stream its logs to the UI
+//!   * expose the updater (tauri-plugin-updater) to the frontend
+
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! main.rs — SCP-GHOST Desktop (Tauri v2) — **controller only**
-//!
-//! این crate هیچ کد شبکه، TUN، سوکت، TLS یا رمزنگاری ندارد. تمام آن کارها
-//! به هستهٔ پراکسی (sidecar) سپرده شده است. وظیفهٔ این فایل فقط:
-//!
-//!   1. دریافت متن اشتراک (HTTP GET ساده — تا CORS گریبان webview را نگیرد)
-//!   2. نوشتن کانفیگ YAML تولیدشده روی دیسک
-//!   3. اجرا/توقف sidecar و جمع‌آوری لاگ آن
-//!
-//! تبدیل «URI → YAML» در `src/core-config.js` است تا با آزمون واحد واقعی
-//! پوشش داده شود؛ logic سنگینی در Rust نمانده باشد.
-
-use std::io::Read;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_updater::UpdaterExt;
 
-/// نام sidecar — همان نامی که در `bundle.externalBin` آمده است.
-const SIDECAR_NAME: &str = "meow";
-
-/// فاصلهٔ ثبتی که هستهٔ ما با آن بالا می‌آید (mixed-port).
-const MIXED_PORT: u16 = 7890;
-
-/// سقف حجم اشتراک (۲۵۶ کیلوبایت) تا پاسخ‌های عجیب حافظه را نخورند.
-const MAX_SUBSCRIPTION_BYTES: u64 = 256 * 1024;
-
-/// حداکثر خطوط لاگ نگه‌داری‌شده در حافظه.
-const MAX_LOG_LINES: usize = 400;
-
-// ══════════════════════════════════════════════════════════════
-//  وضعیت برنامه
-// ══════════════════════════════════════════════════════════════
-
-struct CoreProcess {
-    /// مالک فرایند: هر جا این ساختار دور ریخته شود، `kill` صریح صدا زده
-    /// می‌شود تا هیچ meow.exe یتیمی نماند.
-    child: CommandChild,
-    mode: String,
-    config_path: String,
-    pid: u32,
-}
+/// Sidecar base name — must match `bundle.externalBin` in tauri.conf.json.
+const SIDECAR: &str = "meow";
+/// Keep the UI log panel bounded.
+const LOG_LIMIT: usize = 400;
 
 #[derive(Default)]
-struct AppState {
-    core: Mutex<Option<CoreProcess>>,
-    log: Mutex<Vec<String>>,
+struct Runtime {
+    child: Option<CommandChild>,
+    mode: String,
 }
 
-type Shared = std::sync::Arc<AppState>;
+impl Runtime {
+    fn kill(&mut self) {
+        if let Some(child) = self.child.take() {
+            let _ = child.kill();
+        }
+        self.mode.clear();
+    }
+}
 
-// ══════════════════════════════════════════════════════════════
-//  DTO
-// ══════════════════════════════════════════════════════════════
+struct Shared(Mutex<Runtime>);
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self(Mutex::new(Runtime::default()))
+    }
+}
+
+type LogBuffer = Arc<Mutex<VecDeque<String>>>;
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CoreStatus {
     running: bool,
-    mode: Option<String>,
-    pid: Option<u32>,
-    config_path: Option<String>,
-    proxy_url: String,
-    log: Vec<String>,
+    mode: String,
+    version: String,
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SubscriptionPayload {
-    body: String,
-    bytes: usize,
-    status: u16,
+struct UpdateReport {
+    available: bool,
+    current: String,
+    latest: Option<String>,
+    notes: Option<String>,
+    error: Option<String>,
 }
 
-// ══════════════════════════════════════════════════════════════
-//  ابزار
-// ══════════════════════════════════════════════════════════════
-
-fn push_log(shared: &Shared, line: &str) {
-    let cleaned = line.trim_end();
-    if cleaned.is_empty() {
-        return;
-    }
-    if let Ok(mut log) = shared.log.lock() {
-        for part in cleaned.lines() {
-            log.push(part.to_string());
-        }
-        if log.len() > MAX_LOG_LINES {
-            let drop_count = log.len() - MAX_LOG_LINES;
-            log.drain(0..drop_count);
-        }
-    }
-}
-
-fn snapshot(shared: &Shared) -> CoreStatus {
-    let (running, mode, pid, config_path) = match shared.core.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(core) => (
-                true,
-                Some(core.mode.clone()),
-                Some(core.pid),
-                Some(core.config_path.clone()),
-            ),
-            None => (false, None, None, None),
-        },
-        Err(_) => (false, None, None, None),
+fn push_log(logs: &LogBuffer, line: String) {
+    let mut guard = match logs.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     };
+    for raw in line.lines() {
+        let trimmed = raw.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        guard.push_back(trimmed.chars().take(400).collect::<String>());
+    }
+    while guard.len() > LOG_LIMIT {
+        guard.pop_front();
+    }
+}
 
-    let log = shared
-        .log
-        .lock()
-        .map(|lines| lines.iter().rev().take(120).rev().cloned().collect())
-        .unwrap_or_default();
-
+fn status(app: &AppHandle, running: bool, mode: String) -> CoreStatus {
     CoreStatus {
         running,
         mode,
-        pid,
-        config_path,
-        proxy_url: format!("http://127.0.0.1:{MIXED_PORT}"),
-        log,
+        version: app.package_info().version.to_string(),
     }
 }
 
-fn ensure_scheme(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        Ok(())
-    } else {
-        Err("آدرس اشتراک باید با http:// یا https:// شروع شود.".to_string())
-    }
+fn current_state(app: &AppHandle, shared: &State<'_, Shared>) -> CoreStatus {
+    let guard = match shared.0.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    status(app, guard.child.is_some(), guard.mode.clone())
 }
 
-// ══════════════════════════════════════════════════════════════
-//  دستورها
-// ══════════════════════════════════════════════════════════════
-
-/// متن اشتراک را از سرور می‌خواند (بدون هیچ پردازشی).
-///
-/// دریافت در Rust انجام می‌شود تا webview درگیر CORS نشود و بتوان
-/// کدهای خطای HTTP را با پیام واقعی سرور به کاربر نشان داد.
 #[tauri::command]
-async fn fetch_subscription(url: String) -> Result<SubscriptionPayload, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        ensure_scheme(&url)?;
-
-        let response = match ureq::get(&url)
-            .timeout(Duration::from_secs(20))
-            .set("Accept", "*/*")
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(code, response)) => {
-                let mut detail = String::new();
-                let _ = response
-                    .into_reader()
-                    .take(4096)
-                    .read_to_string(&mut detail);
-                return Err(format!(
-                    "اشتراک با کد HTTP {code} پاسخ داد: {}",
-                    detail.trim()
-                ));
-            }
-            Err(err) => return Err(format!("دسترسی به آدرس اشتراک ممکن نشد: {err}")),
-        };
-
-        let status = response.status();
-        let mut body = String::new();
-        response
-            .into_reader()
-            .take(MAX_SUBSCRIPTION_BYTES)
-            .read_to_string(&mut body)
-            .map_err(|e| format!("خواندن پاسخ اشتراک ناموفق بود: {e}"))?;
-
-        if body.trim().is_empty() {
-            return Err("پاسخ اشتراک خالی بود.".to_string());
-        }
-
-        Ok(SubscriptionPayload {
-            bytes: body.len(),
-            status,
-            body,
-        })
-    })
-    .await
-    .map_err(|e| format!("fetch task failed: {e}"))?
+fn core_state(app: AppHandle, shared: State<'_, Shared>) -> CoreStatus {
+    current_state(&app, &shared)
 }
 
-/// کانفیگ YAML را می‌نویسد و هسته را اجرا می‌کند.
 #[tauri::command]
-async fn start_core(
-    app: tauri::AppHandle,
-    state: State<'_, Shared>,
+fn start_core(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    logs: State<'_, LogBuffer>,
     config: String,
     mode: String,
 ) -> Result<CoreStatus, String> {
-    let shared = std::sync::Arc::clone(state.inner());
+    let mode = if mode == "proxy" { "proxy" } else { "tun" }.to_string();
 
-    if shared
-        .core
-        .lock()
-        .map(|guard| guard.is_some())
-        .unwrap_or(false)
     {
-        return Err("هسته از قبل در حال اجراست؛ اول قطع کنید.".to_string());
+        let mut guard = match shared.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.kill();
     }
 
-    if config.trim().is_empty() || !config.contains("proxies:") {
-        return Err("کانفیگ تولیدشده معتبر نیست.".to_string());
-    }
-
-    let data_dir = app
+    let home = app
         .path()
         .app_local_data_dir()
-        .map_err(|e| format!("مسیر دادهٔ برنامه پیدا نشد: {e}"))?;
-    let core_home = data_dir.join("core");
-    let config_path = core_home.join("config.yaml");
+        .map_err(|err| format!("cannot resolve app data directory: {err}"))?
+        .join("core");
+    std::fs::create_dir_all(&home)
+        .map_err(|err| format!("cannot create {}: {err}", home.display()))?;
 
-    std::fs::create_dir_all(&core_home)
-        .map_err(|e| format!("ساخت پوشهٔ کانفیگ ناموفق بود: {e}"))?;
+    let config_path = home.join("config.yaml");
     std::fs::write(&config_path, config.as_bytes())
-        .map_err(|e| format!("نوشتن کانفیگ ناموفق بود: {e}"))?;
+        .map_err(|err| format!("cannot write {}: {err}", config_path.display()))?;
 
-    let config_arg = config_path
-        .to_str()
-        .ok_or_else(|| "مسیر کانفیگ قابل تبدیل به رشته نیست.".to_string())?
-        .to_string();
-    let home_arg = core_home
-        .to_str()
-        .ok_or_else(|| "مسیر home قابل تبدیل به رشته نیست.".to_string())?
-        .to_string();
+    let sidecar = app
+        .shell()
+        .sidecar(SIDECAR)
+        .map_err(|err| format!("the meow core is not bundled with this build: {err}"))?;
 
-    if let Ok(mut log) = shared.log.lock() {
-        log.clear();
-    }
-    push_log(&shared, &format!("[app] mode={mode} config={config_arg}"));
-
-    let args: Vec<String> = vec![
+    let args = vec![
         "-d".to_string(),
-        home_arg,
+        home.to_string_lossy().to_string(),
         "-f".to_string(),
-        config_arg.clone(),
+        config_path.to_string_lossy().to_string(),
     ];
 
-    let command = app
-        .shell()
-        .sidecar(SIDECAR_NAME)
-        .map_err(|e| format!("sidecar «{SIDECAR_NAME}» پیدا نشد: {e}"))?
-        .args(args);
-
-    let (mut rx, child) = command
+    let (mut events, child) = sidecar
+        .args(args)
         .spawn()
-        .map_err(|e| format!("اجرای هستهٔ پراکسی ناموفق بود: {e}"))?;
+        .map_err(|err| format!("meow core failed to start: {err}"))?;
 
-    let pid = child.pid();
-    push_log(&shared, &format!("[app] core started (pid {pid})"));
+    let buffer = logs.inner().clone();
+    push_log(&buffer, format!("[scp-ghost] core started in {mode} mode"));
 
-    {
-        let mut guard = shared
-            .core
-            .lock()
-            .map_err(|_| "state lock poisoned".to_string())?;
-        *guard = Some(CoreProcess {
-            child,
-            mode: mode.clone(),
-            config_path: config_arg,
-            pid,
-        });
-    }
-
-    // حلقهٔ جمع‌آوری لاگ هسته
-    let log_state = std::sync::Arc::clone(&shared);
     tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        while let Some(event) = events.recv().await {
             match event {
-                CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    push_log(&log_state, &text);
+                CommandEvent::Stdout(bytes) => {
+                    push_log(&buffer, String::from_utf8_lossy(&bytes).to_string())
                 }
-                CommandEvent::Error(err) => {
-                    push_log(&log_state, &format!("[core error] {err}"));
+                CommandEvent::Stderr(bytes) => {
+                    push_log(&buffer, String::from_utf8_lossy(&bytes).to_string())
                 }
+                CommandEvent::Error(err) => push_log(&buffer, format!("[error] {err}")),
                 CommandEvent::Terminated(payload) => {
                     push_log(
-                        &log_state,
-                        &format!(
-                            "[app] core exited (code {:?}, signal {:?})",
-                            payload.code, payload.signal
-                        ),
+                        &buffer,
+                        format!("[scp-ghost] core exited ({:?})", payload.code),
                     );
-                    if let Ok(mut guard) = log_state.core.lock() {
-                        *guard = None;
-                    }
                     break;
                 }
                 _ => {}
@@ -304,62 +176,127 @@ async fn start_core(
         }
     });
 
-    Ok(snapshot(&shared))
-}
-
-#[tauri::command]
-fn stop_core(state: State<'_, Shared>) -> Result<CoreStatus, String> {
-    let shared = std::sync::Arc::clone(state.inner());
-
-    let taken = shared
-        .core
-        .lock()
-        .map_err(|_| "state lock poisoned".to_string())?
-        .take();
-
-    match taken {
-        Some(core) => {
-            let CoreProcess { child, pid, .. } = core;
-            // kill(self) تا خروج فرایند کامل شود و بعد لاگ ثبت شود
-            if let Err(err) = child.kill() {
-                push_log(&shared, &format!("[app] core did not stop cleanly: {err}"));
-            }
-            push_log(&shared, &format!("[app] core stopped (pid {pid})"));
-        }
-        None => push_log(&shared, "[app] stop requested but core was not running"),
+    {
+        let mut guard = match shared.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.mode = mode.clone();
+        guard.child = Some(child);
     }
 
-    Ok(snapshot(&shared))
+    Ok(status(&app, true, mode))
 }
 
 #[tauri::command]
-fn core_status(state: State<'_, Shared>) -> CoreStatus {
-    snapshot(state.inner())
+fn stop_core(app: AppHandle, shared: State<'_, Shared>) -> Result<CoreStatus, String> {
+    {
+        let mut guard = match shared.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.kill();
+    }
+    Ok(status(&app, false, String::new()))
 }
 
-// ══════════════════════════════════════════════════════════════
-//  Entry point
-// ══════════════════════════════════════════════════════════════
+#[tauri::command]
+fn read_logs(logs: State<'_, LogBuffer>) -> Vec<String> {
+    let guard = match logs.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.iter().cloned().collect()
+}
+
+#[tauri::command]
+fn clear_logs(logs: State<'_, LogBuffer>) {
+    let mut guard = match logs.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.clear();
+}
+
+#[tauri::command]
+async fn check_updates(app: AppHandle) -> Result<UpdateReport, String> {
+    let current = app.package_info().version.to_string();
+
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        Err(err) => {
+            return Ok(UpdateReport {
+                available: false,
+                current,
+                latest: None,
+                notes: None,
+                error: Some(err.to_string()),
+            })
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateReport {
+            available: true,
+            current,
+            latest: Some(update.version.clone()),
+            notes: update.body.clone(),
+            error: None,
+        }),
+        Ok(None) => Ok(UpdateReport {
+            available: false,
+            current,
+            latest: None,
+            notes: None,
+            error: None,
+        }),
+        Err(err) => Ok(UpdateReport {
+            available: false,
+            current,
+            latest: None,
+            notes: None,
+            error: Some(err.to_string()),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "no update is available".to_string())?;
+
+    update
+        .download_and_install(|_chunk: usize, _total: Option<u64>| {}, || {})
+        .await
+        .map_err(|err| err.to_string())
+}
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(std::sync::Arc::new(AppState::default()))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(Shared::default())
+        .manage(LogBuffer::default())
         .invoke_handler(tauri::generate_handler![
-            fetch_subscription,
+            core_state,
             start_core,
             stop_core,
-            core_status
+            read_logs,
+            clear_logs,
+            check_updates,
+            install_update
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build the SCP-GHOST desktop app")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
-                if let Some(shared) = app_handle.try_state::<Shared>() {
-                    let orphan = shared.core.lock().ok().and_then(|mut guard| guard.take());
-                    if let Some(core) = orphan {
-                        // kill(self) فرایند را می‌کشد و برای خروج صبر می‌کند
-                        let _ = core.child.kill();
+        .expect("failed to build the SCP-GHOST shell")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Exit) {
+                if let Some(shared) = app.try_state::<Shared>() {
+                    if let Ok(mut guard) = shared.0.lock() {
+                        guard.kill();
                     }
                 }
             }

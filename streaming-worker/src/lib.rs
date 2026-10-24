@@ -1,20 +1,26 @@
 //! lib.rs — Streaming Worker (workers-rs 0.8.7)
 //!
 //! Endpoints:
+//!   GET /vless   → سرور VLESS روی WebSocket (cloudflare:sockets) ← تونل واقعی
 //!   GET /stream  → HMAC-verified streaming pipe (allowlist مقصد)
 //!   GET /sub     → اشتراک VLESS به صورت Base64 (fail-closed)
 //!   GET /health  → وضعیت worker
 //!
-//! دو بخش اصلی:
+//! سه بخش اصلی:
 //!   1. SlidingWindowRateLimiter — Durable Object با SQLite
-//!   2. main Worker handler — routing + HMAC verify + stream pipe
+//!   2. VLESS-over-WebSocket — پارسر هدر + پمپ دوطرفه روی TCP خروجی
+//!   3. main Worker handler — routing + HMAC verify + stream pipe
 //!
-//! ── نکتهٔ امنیتی مهم دربارهٔ /sub ────────────────────────────────
-//! این worker خودش یک سرور VLESS **نیست**. `/sub` فقط یک لینک
-//! استاندارد می‌سازد که به یک سرور VLESS واقعی (Xray/sing-box)
-//! اشاره می‌کند؛ مقصد از `VLESS_HOST` خوانده می‌شود و هرگز به
-//! خودِ این worker برنمی‌گردد. اگر پارامترها تنظیم نشده باشند،
-//! endpoint عمداً 503 می‌دهد تا کلاینتی لینک مرده نگیرد.
+//! ── «Cocoon in Cocoon» ──────────────────────────────────────────
+//! از نسخهٔ 5.4.0 این worker **خودش** یک سرور VLESS است: کلاینت با
+//! WS/TLS به همین دامنه وصل می‌شود، worker هدر VLESS را می‌خواند و با
+//! `cloudflare:sockets` به مقصد وصل می‌شود. یعنی ورود و خروج هر دو
+//! داخل شبکهٔ Cloudflare هستند و DPI فقط ترافیک HTTPS به CDN می‌بیند.
+//!
+//! `/sub` هم دیگر به سرور بیرونی اشاره نمی‌کند: میزبان پیش‌فرض همان
+//! دامنهٔ همین درخواست است (قابل override با `VLESS_HOST` برای دامنهٔ
+//! اختصاصی). بدون `SUB_TOKEN` و `VLESS_UUID` endpoint عمداً 503 می‌دهد
+//! (fail-closed) تا کلاینتی لینک مرده نگیرد.
 //!
 //! ── یادداشت مهاجرت به worker 0.8.7 ──────────────────────────────
 //! تغییرات API نسبت به 0.5 که در این فایل اعمال شده‌اند:
@@ -243,6 +249,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let router = Router::new();
     router
         .get_async("/stream", handle_stream)
+        .get_async("/vless", handle_vless)
         .get_async("/sub", handle_subscription)
         .get("/health", |_req, ctx| {
             let version = ctx
@@ -585,21 +592,348 @@ fn is_allowed_target(raw_url: &str) -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  /vless — سرور VLESS روی WebSocket + cloudflare:sockets
+//
+//  «Cocoon in Cocoon»: کلاینت → Cloudflare (WS/TLS روی ۴۴۳) →
+//  همین worker (پارسر VLESS) → connect() → مقصد نهایی.
+//  نه VPS، نه سرور واسط؛ ورود و خروج هر دو داخل Cloudflare.
+//
+//  قالب درخواست VLESS v0:
+//    [0]     version = 0
+//    [1..17] uuid (۱۶ بایت خام)
+//    [17]    opt_len
+//    [...]   opts
+//    [...]   command (۱ = TCP، ۲ = UDP)
+//    [...]   port (۲ بایت big-endian)
+//    [...]   atyp (۱ = IPv4، ۲ = domain، ۳ = IPv6)
+//    [...]   address
+//    [...]   payload — اختیاری و می‌تواند در فریم‌های بعدی ادامه یابد
+//
+//  پاسخ سرور: [version = 0, opt_len = 0] و سپس جریان خام.
+// ══════════════════════════════════════════════════════════════
+
+const VLESS_VERSION: u8 = 0;
+const VLESS_CMD_TCP: u8 = 1;
+const VLESS_ATYP_IPV4: u8 = 1;
+const VLESS_ATYP_DOMAIN: u8 = 2;
+const VLESS_ATYP_IPV6: u8 = 3;
+
+/// سقف هدر (بایت) — جلوی مصرف حافظه با فریم‌های بی‌پایان را می‌گیرد.
+const VLESS_MAX_HEADER: usize = 1024;
+/// اندازهٔ بافر پمپ سمت مقصد.
+const VLESS_PIPE_BUF: usize = 16 * 1024;
+
+enum HeaderParse {
+    NeedMore,
+    Ready {
+        addr: String,
+        port: u16,
+        consumed: usize,
+    },
+    Rejected(&'static str),
+}
+
+/// UUID متنی (با یا بدون خط تیره) → ۱۶ بایت خام
+fn parse_uuid_bytes(value: &str) -> Option<[u8; 16]> {
+    let hex: String = value.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let raw = hex.as_bytes();
+    let mut out = [0u8; 16];
+    for index in 0..16 {
+        let hi = (raw[index * 2] as char).to_digit(16)?;
+        let lo = (raw[index * 2 + 1] as char).to_digit(16)?;
+        out[index] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+/// مقصدهایی که هرگز نباید از این پل عبور کنند (شبکهٔ داخلی/metadata).
+///
+/// فقط IPهای واقعی با روش عددی بررسی می‌شوند؛ دامنه‌ها تنها با نام دقیق
+/// مسدود می‌شوند تا دامنه‌ای مثل `fcbarcelona.com` اشتباهی رد نشود.
+fn is_blocked_destination(host: &str) -> bool {
+    let lower = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if matches!(lower.as_str(), "localhost" | "metadata.google.internal") {
+        return true;
+    }
+    match lower.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00   // fc00::/7 — unique local
+                || (first & 0xffc0) == 0xfe80   // fe80::/10 — link local
+        }
+        Err(_) => false,
+    }
+}
+
+/// پارس افزایشی هدر VLESS — تابع خالص، بدون هیچ I/O.
+fn parse_vless_header(buf: &[u8], expected_uuid: &[u8; 16]) -> HeaderParse {
+    // حداقل: version + uuid + opt_len
+    if buf.len() < 18 {
+        return HeaderParse::NeedMore;
+    }
+    if buf[0] != VLESS_VERSION {
+        return HeaderParse::Rejected("unsupported version");
+    }
+    if &buf[1..17] != expected_uuid {
+        return HeaderParse::Rejected("uuid mismatch");
+    }
+
+    let opt_len = buf[17] as usize;
+    let mut cursor = 18 + opt_len;
+    // command + port(2) + atyp
+    if buf.len() < cursor + 4 {
+        return HeaderParse::NeedMore;
+    }
+
+    let command = buf[cursor];
+    cursor += 1;
+    if command != VLESS_CMD_TCP {
+        // UDP/QUIC در این نسخه پشتیبانی نمی‌شود
+        return HeaderParse::Rejected("unsupported command");
+    }
+
+    let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
+    cursor += 2;
+    if port == 0 {
+        return HeaderParse::Rejected("invalid port");
+    }
+
+    let atyp = buf[cursor];
+    cursor += 1;
+
+    let addr = match atyp {
+        VLESS_ATYP_IPV4 => {
+            if buf.len() < cursor + 4 {
+                return HeaderParse::NeedMore;
+            }
+            let octets = &buf[cursor..cursor + 4];
+            cursor += 4;
+            std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]).to_string()
+        }
+        VLESS_ATYP_DOMAIN => {
+            if buf.len() < cursor + 1 {
+                return HeaderParse::NeedMore;
+            }
+            let len = buf[cursor] as usize;
+            cursor += 1;
+            if len == 0 || len > 253 {
+                return HeaderParse::Rejected("invalid domain length");
+            }
+            if buf.len() < cursor + len {
+                return HeaderParse::NeedMore;
+            }
+            let host = String::from_utf8_lossy(&buf[cursor..cursor + len]).to_string();
+            cursor += len;
+            host
+        }
+        VLESS_ATYP_IPV6 => {
+            if buf.len() < cursor + 16 {
+                return HeaderParse::NeedMore;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[cursor..cursor + 16]);
+            cursor += 16;
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => return HeaderParse::Rejected("unsupported address type"),
+    };
+
+    if addr.is_empty() || is_blocked_destination(&addr) {
+        return HeaderParse::Rejected("destination not allowed");
+    }
+
+    HeaderParse::Ready {
+        addr,
+        port,
+        consumed: cursor,
+    }
+}
+
+fn ws_close(ws: &WebSocket, code: u16, reason: &str) {
+    let _ = ws.close(Some(code), Some(reason));
+}
+
+/// حلقهٔ اصلی: گرفتن هدر، اتصال به مقصد، پمپ دوطرفه.
+async fn pipe_vless(ws: WebSocket, expected_uuid: [u8; 16]) {
+    use futures_util::StreamExt;
+
+    let mut events = match ws.events() {
+        Ok(events) => events,
+        Err(_) => return,
+    };
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(VLESS_MAX_HEADER);
+    let (addr, port, consumed) = loop {
+        match events.next().await {
+            Some(Ok(WebsocketEvent::Message(message))) => {
+                let Some(bytes) = message.bytes() else {
+                    ws_close(&ws, 1003, "binary frames only");
+                    return;
+                };
+                buffer.extend_from_slice(&bytes);
+                if buffer.len() > VLESS_MAX_HEADER {
+                    ws_close(&ws, 1009, "header too large");
+                    return;
+                }
+                match parse_vless_header(&buffer, &expected_uuid) {
+                    HeaderParse::NeedMore => continue,
+                    HeaderParse::Ready {
+                        addr,
+                        port,
+                        consumed,
+                    } => break (addr, port, consumed),
+                    HeaderParse::Rejected(reason) => {
+                        console_log!("[Ghost VLESS] rejected: {}", reason);
+                        ws_close(&ws, 1008, "invalid VLESS header");
+                        return;
+                    }
+                }
+            }
+            _ => {
+                ws_close(&ws, 1002, "closed before header");
+                return;
+            }
+        }
+    };
+
+    // ── اتصال واقعی به مقصد از داخل Cloudflare ───────────────
+    let socket = match Socket::builder().connect(addr.clone(), port) {
+        Ok(socket) => socket,
+        Err(err) => {
+            console_log!("[Ghost VLESS] connect({}:{}) failed: {:?}", addr, port, err);
+            ws_close(&ws, 1011, "connect failed");
+            return;
+        }
+    };
+
+    if let Err(err) = socket.opened().await {
+        console_log!("[Ghost VLESS] opened() failed: {:?}", err);
+        ws_close(&ws, 1011, "connect failed");
+        return;
+    }
+
+    // پاسخ VLESS v0
+    if ws.send_with_bytes([VLESS_VERSION, 0u8]).is_err() {
+        return;
+    }
+
+    // ── پمپ دوطرفه ────────────────────────────────────────────
+    // split باعث می‌شود دو جهت، دو مالک جدا داشته باشند و borrow checker
+    // بهانه‌ای برای رد کردن select نداشته باشد.
+    let (mut reader, mut writer) = tokio::io::split(socket);
+
+    // بایت‌هایی از payload که همراه هدر آمده بودند
+    if let Some(rest) = buffer.get(consumed..) {
+        if !rest.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            if writer.write_all(rest).await.is_err() {
+                ws_close(&ws, 1011, "write failed");
+                return;
+            }
+        }
+    }
+
+    let upstream = async {
+        use tokio::io::AsyncWriteExt;
+        while let Some(Ok(WebsocketEvent::Message(message))) = events.next().await {
+            match message.bytes() {
+                Some(bytes) if !bytes.is_empty() => {
+                    if writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = writer.shutdown().await;
+    };
+
+    let downstream = async {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = vec![0u8; VLESS_PIPE_BUF];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if ws.send_with_bytes(&chunk[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    futures_util::future::select(Box::pin(upstream), Box::pin(downstream)).await;
+
+    ws_close(&ws, 1000, "done");
+}
+
+async fn handle_vless(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    // فقط ارتقای WebSocket پذیرفته می‌شود
+    let upgrade = req
+        .headers()
+        .get("Upgrade")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !upgrade.eq_ignore_ascii_case("websocket") {
+        return Response::error("Expected a WebSocket upgrade on /vless", 426);
+    }
+
+    let uuid_value = read_setting(&ctx, "VLESS_UUID");
+    let Some(expected_uuid) = parse_uuid_bytes(&uuid_value) else {
+        console_log!("[Ghost VLESS] endpoint disabled: VLESS_UUID missing or invalid");
+        return Response::error("VLESS endpoint is not configured", 503);
+    };
+
+    let client_ip = req
+        .headers()
+        .get("CF-Connecting-IP")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if let Some(limited) = check_rate_limit(&ctx, &client_ip).await {
+        return Ok(limited);
+    }
+
+    let WebSocketPair { client, server } = WebSocketPair::new()?;
+    server.accept()?;
+
+    // حلقهٔ تونل نباید پاسخ را بلوکه کند
+    wasm_bindgen_futures::spawn_local(async move {
+        pipe_vless(server, expected_uuid).await;
+    });
+
+    Response::from_websocket(client)
+}
+
+// ══════════════════════════════════════════════════════════════
 //  /sub — اشتراک VLESS (Base64)
 //
-//  این worker سرور VLESS نیست. این endpoint فقط یک URI استاندارد
-//  می‌سازد که به سرور واقعی (VLESS_HOST) اشاره می‌کند.
+//  URI خروجی به **خودِ همین worker** اشاره می‌کند (مسیر /vless)، نه به
+//  یک سرور بیرونی. یعنی همان لینکی که کلاینت import می‌کند، تونل واقعی
+//  Cocoon-in-Cocoon را می‌سازد.
 //
 //  فیلدها:
 //    Secret  SUB_TOKEN    توکن اجباری (>= 24 کاراکتر) — بدون آن endpoint خاموش است
-//    Secret  VLESS_UUID   UUID کلاینت روی سرور VLESS
-//    Var     VLESS_HOST   دامنهٔ سرور VLESS (بدون scheme)
+//    Secret  VLESS_UUID   UUID کلاینت (همان که در هدر VLESS چک می‌شود)
+//    Var     VLESS_HOST   اختیاری — دامنهٔ اختصاصی جلو‌ی worker
 //    Var     VLESS_PATH   مسیر WebSocket (پیش‌فرض /vless)
-//    Var     VLESS_SNI    پیش‌فرض = VLESS_HOST
+//    Var     VLESS_SNI    پیش‌فرض = همان host
 //    Var     VLESS_REMARK نام نمایشی نود (پیش‌فرض SCP-GHOST)
 //
-//  چرا fail-closed: لینک VLESS به یک سرور غیر-VLESS = تونل مرده.
-//  بهتر است endpoint 503 بدهد تا کلاینت لینک بی‌مصرف import نکند.
+//  چرا fail-closed: بدون VLESS_UUID هیچ تونلی وجود ندارد؛ بهتر است
+//  endpoint 503 بدهد تا کلاینت لینک بی‌مصرف import نکند.
 // ══════════════════════════════════════════════════════════════
 
 const SUB_TOKEN_MIN_LEN: usize = 24;
@@ -750,8 +1084,8 @@ async fn handle_subscription(req: Request, ctx: RouteContext<()>) -> Result<Resp
         );
         let body = serde_json::json!({
             "error": "subscription_not_configured",
-            "message": "Subscription endpoint is disabled. Set SUB_TOKEN (>= 24 chars), VLESS_UUID and VLESS_HOST, then retry.",
-            "missing": ["SUB_TOKEN", "VLESS_UUID", "VLESS_HOST"],
+            "message": "Subscription endpoint is disabled. Set SUB_TOKEN (>= 24 chars) and VLESS_UUID, then retry.",
+            "missing": ["SUB_TOKEN", "VLESS_UUID"],
         })
         .to_string();
         return sub_response(503, "unconfigured", "application/json; charset=utf-8", body);
@@ -793,7 +1127,20 @@ async fn handle_subscription(req: Request, ctx: RouteContext<()>) -> Result<Resp
     // هر مقدار می‌تواند secret باشد یا var — ترتیب: secret، بعد var.
     // (کاربر نباید درگیر این شود که کدام را کجا گذاشته است.)
     let uuid = read_setting(&ctx, "VLESS_UUID");
-    let host = read_setting(&ctx, "VLESS_HOST");
+
+    // میزبان پیش‌فرض: همان دامنه‌ای که /sub روی آن صدا زده شده است
+    // (workers.dev یا دامنهٔ اختصاصی). VLESS_HOST فقط override است.
+    let request_host = req
+        .url()
+        .ok()
+        .and_then(|url| url.host_str().map(|value| value.to_string()))
+        .unwrap_or_default();
+    let configured_host = read_setting(&ctx, "VLESS_HOST");
+    let host = if configured_host.is_empty() {
+        request_host
+    } else {
+        configured_host
+    };
 
     let path = {
         let value = read_setting(&ctx, "VLESS_PATH");
@@ -857,6 +1204,6 @@ async fn handle_subscription(req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     let encoded = B64.encode(build_vless_uri(&node).as_bytes());
 
-    console_log!("[Ghost Streaming] /sub served 1 node ({})", host);
+    console_log!("[Ghost Streaming] /sub served 1 node (ws {}:{})", host, path);
     sub_response(200, "ok", "text/plain; charset=utf-8", encoded)
 }
