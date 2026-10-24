@@ -386,7 +386,7 @@
   <div class="card">
     <div class="card__title">عملیات</div>
     <div class="btn-row">
-      <button class="btn btn--primary" id="btn-connect" onclick="connectSession()">
+      <button class="btn btn--primary" id="btn-connect" onclick="connectSession()" disabled>
         🔗 اتصال و Init Session
       </button>
       <button class="btn" id="btn-refresh" onclick="refreshStatus()">
@@ -424,11 +424,16 @@
 
 // این مقدار توسط deploy-pages.yml inject می‌شود
 const SIGNALING_URL = "__CF_SIGNALING_URL__";
-const SW_VERSION    = "5.0.0";
+const SW_VERSION    = "5.1.3";
 
 let swRegistration  = null;
 let configVersion   = "—";
 let wasmReady       = false;  // Wasm ماژول در Service Worker لود و آماده است؟
+
+const WASM_LOAD_TIMEOUT_MS = 5000;
+const WASM_LOAD_ERROR      = "Wasm failed to load. Please refresh.";
+let wasmLoadTimeout        = null;
+let wasmFailureReported    = false;
 
 // ── DOM References ─────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -466,92 +471,196 @@ function setBanner(icon, text, type) {
   banner.className = `connection-banner${type ? ` connection-banner--${type}` : ""}`;
 }
 
-// دکمه اتصال فقط فعال شود وقتی SW فعال و Wasm لود شده باشد
+// دکمه اتصال فقط وقتی فعال می‌شود که SW کنترل را گرفته و Wasm لود شده باشد.
 function updateConnectButton() {
   const btn = $("btn-connect");
   if (!btn) return;
-  btn.disabled = !wasmReady || !swRegistration?.active;
+
+  const swActive = Boolean(
+    swRegistration?.active ||
+    ("serviceWorker" in navigator && navigator.serviceWorker.controller)
+  );
+  btn.disabled = !wasmReady || !swActive;
+}
+
+function markWasmReady(label = "Wasm آماده") {
+  if (wasmLoadTimeout) {
+    clearTimeout(wasmLoadTimeout);
+    wasmLoadTimeout = null;
+  }
+
+  const firstReady = !wasmReady;
+  wasmReady = true;
+  wasmFailureReported = false;
+  setDot("wasm", "ok", label);
+  if (firstReady) {
+    log("Wasm ماژول در Service Worker لود شد.", "ok");
+  }
+  updateConnectButton();
+}
+
+function reportWasmFailure() {
+  if (wasmLoadTimeout) {
+    clearTimeout(wasmLoadTimeout);
+    wasmLoadTimeout = null;
+  }
+
+  wasmReady = false;
+  if (!wasmFailureReported) {
+    // پیام دقیق fail-safe — حتی اگر activation یا GET_STATUS هرگز resolve نشود.
+    log(WASM_LOAD_ERROR, "error");
+    wasmFailureReported = true;
+  }
+
+  setDot("wasm", "error", "Wasm خطا");
+  setBanner("❌", "Wasm لود نشد", "error");
+  updateConnectButton();
+}
+
+function armWasmLoadFailSafe() {
+  if (wasmLoadTimeout) clearTimeout(wasmLoadTimeout);
+  wasmFailureReported = false;
+
+  // تایمر قبل از register/waitForActive آغاز می‌شود تا awaitهای بالقوهٔ hung
+  // نتوانند fail-safe را به تأخیر بیندازند.
+  wasmLoadTimeout = setTimeout(() => {
+    wasmLoadTimeout = null;
+    if (!wasmReady) reportWasmFailure();
+  }, WASM_LOAD_TIMEOUT_MS);
+}
+
+// GET_STATUS همیشه جواب ندارد (SW ممکن است در حال restart باشد). پس timeout دارد.
+function requestServiceWorkerStatus(sw, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    if (!sw) {
+      resolve(null);
+      return;
+    }
+
+    const channel = new MessageChannel();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    channel.port1.onmessage = (event) => finish(event.data);
+
+    try {
+      sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
+    } catch (err) {
+      console.error("[Ghost] GET_STATUS failed:", err);
+      finish(null);
+    }
+  });
+}
+
+if ("serviceWorker" in navigator) {
+  // ممکن است claim بعد از WASM_READY اعمال شود؛ دکمه همان موقع آزاد شود.
+  navigator.serviceWorker.addEventListener("controllerchange", updateConnectButton);
 }
 
 // ──────────────────────────────────────────────────────────────
 //  STEP 1: ثبت Service Worker
 // ──────────────────────────────────────────────────────────────
-async function registerServiceWorker() {
-  if (!("serviceWorker" in navigator)) {
-    log("مرورگر شما از Service Worker پشتیبانی نمی‌کند.", "error");
-    setDot("sw", "error", "پشتیبانی نمی‌شود");
-    setBanner("❌", "مرورگر ناسازگار", "error");
-    return;
-  }
-
+async function registerGhostServiceWorker() {
+  // برخی مرورگرها هنوز { type: "module" } را نمیپذیرند. sw.js فقط dynamic
+  // import دارد، پس در صورت نیاز همان فایل به صورت classic هم قابل ثبت است.
   try {
-    log("در حال ثبت Service Worker...", "info");
-    swRegistration = await navigator.serviceWorker.register("./sw.js", {
-      type: "module",   // ES Module Service Worker
+    return await navigator.serviceWorker.register("./sw.js", {
+      type: "module",
       scope: "./",
     });
-
-    log("Service Worker ثبت شد. در انتظار فعال‌سازی...", "info");
-    setDot("sw", "warn", "در انتظار فعال‌سازی");
-
-    // منتظر فعال شدن SW می‌مانیم
-    await waitForActiveServiceWorker(swRegistration);
-
-    log("Service Worker فعال است.", "ok");
-    setDot("sw", "ok", "فعال");
-    $("sw-version").textContent = `SW: v${SW_VERSION}`;
-
-    // اگر broadcasts قبل از ثبت listener ارسال شده باشد، وضعیت را مستقیماً چک کن
-    try {
-      const sw = swRegistration.active;
-      if (sw) {
-        const status = await new Promise((resolve) => {
-          const channel = new MessageChannel();
-          channel.port1.onmessage = (e) => resolve(e.data);
-          sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
-        });
-        if (status?.wasmLoaded) {
-          wasmReady = true;
-          setDot("wasm", "ok", "Wasm آماده");
-        }
-      }
-    } catch (_) {
-      // broadcast/PING بعداً własnie mismo تکمیل می‌کند
-    }
-    updateConnectButton();
-
-    // Fail-safe: اگر ۵ ثانیه بعد از ثبت SW، wasmReady فعال نشده باشد،
-    // خطای صريح در لاگ نمایش داده می‌شود.
-    setTimeout(() => {
-      if (!wasmReady) {
-        log("❌ Wasm ماژول در Service Worker لود نشد. لطفاً صفحه را رفرش کنید.", "error");
-        setDot("wasm", "error", "Wasm خطا");
-        setBanner("❌", "Wasm لود نشد", "error");
-      }
-    }, 5000);
-
-  } catch (err) {
-    log(`خطا در ثبت Service Worker: ${err.message}`, "error");
-    setDot("sw", "error", "خطا");
-    setBanner("❌", "Service Worker خطا", "error");
+  } catch (moduleErr) {
+    console.warn("[Ghost] Module Service Worker unsupported; retrying classic:", moduleErr);
+    log("Module Service Worker پشتیبانی نشد؛ تلاش با Service Worker معمولی...", "warn");
+    return navigator.serviceWorker.register("./sw.js", { scope: "./" });
   }
 }
 
-function waitForActiveServiceWorker(registration) {
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) {
+    log("مرورگر شما از Service Worker پشتیبانی نمیکند.", "error");
+    setDot("sw", "error", "پشتیبانی نمیشود");
+    setBanner("❌", "مرورگر ناسازگار", "error");
+    reportWasmFailure();
+    return;
+  }
+
+  // تایمر fail-safe در زمان اجرای اسکریپت و قبل از register/wait/GET_STATUS
+  // شروع شده است تا await طولانی یا بیپاسخ نتواند آن را به تأخیر بیندازد.
+  try {
+    log("در حال ثبت Service Worker...", "info");
+    swRegistration = await registerGhostServiceWorker();
+
+    log("Service Worker ثبت شد. در انتظار فعالسازی...", "info");
+    setDot("sw", "warn", "در انتظار فعالسازی");
+
+    // این await حداکثر ۴ ثانیه منتظر میماند؛ fail-safe مستقل همچنان فعال است.
+    await waitForActiveServiceWorker(swRegistration);
+
+    const sw = swRegistration.active || navigator.serviceWorker.controller;
+    if (sw) {
+      log("Service Worker فعال است.", "ok");
+      setDot("sw", "ok", "فعال");
+    } else {
+      log("Service Worker هنوز کنترل صفحه را نگرفته است.", "warn");
+      setDot("sw", "warn", "در انتظار کنترل");
+    }
+    $("sw-version").textContent = `SW: v${SW_VERSION}`;
+    updateConnectButton();
+
+    // اگر broadcast زودتر از listener رسیده باشد، وضعیت را مستقیماً میخوانیم.
+    const status = await requestServiceWorkerStatus(sw, 1500);
+    if (status?.wasmLoaded || status?.wasmReady) {
+      markWasmReady();
+    } else if (sw && !wasmReady) {
+      // PING هم init احتمالی را تکمیل میکند و هم WASM_READY را دوباره میفرستد.
+      sw.postMessage({ type: "PING" });
+    }
+
+  } catch (err) {
+    console.error("[Ghost] Service Worker registration failed:", err);
+    log(`خطا در ثبت Service Worker: ${err.message}`, "error");
+    setDot("sw", "error", "خطا");
+    setBanner("❌", "Service Worker خطا", "error");
+    updateConnectButton();
+  }
+}
+
+function waitForActiveServiceWorker(registration, timeoutMs = 4000) {
   return new Promise((resolve) => {
     if (registration.active) {
       resolve();
       return;
     }
+
     const sw = registration.installing || registration.waiting;
     if (!sw) {
       resolve();
       return;
     }
-    sw.addEventListener("statechange", function handler() {
-      if (sw.state === "activated") {
-        sw.removeEventListener("statechange", handler);
-        resolve();
+
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      updateConnectButton();
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      log("فعالسازی Service Worker بیش از حد طول کشید؛ بررسی ادامه مییابد.", "warn");
+      finish();
+    }, timeoutMs);
+
+    sw.addEventListener("statechange", () => {
+      updateConnectButton();
+      if (sw.state === "activated" || sw.state === "redundant") {
+        finish();
       }
     });
   });
@@ -740,6 +849,7 @@ async function sendInitSession(keys) {
 window.connectSession = async function () {
   $("btn-connect").disabled = true;
   setBanner("⏳", "در حال اتصال...", "");
+  if (!wasmReady && !wasmLoadTimeout && !wasmFailureReported) armWasmLoadFailSafe();
 
   try {
     // Keys دریافت و Session ساخته می‌شود
@@ -749,7 +859,7 @@ window.connectSession = async function () {
     // دکمه Connect تا آن‌جا غیرفعال است، اما برای امنیت بیشتر دوباره چک می‌کنیم.
     if (!wasmReady) {
       log("در انتظار آمادگی Wasm در Service Worker...", "info");
-      const sw = swRegistration?.active;
+      const sw = swRegistration?.active || navigator.serviceWorker.controller;
       if (!sw) {
         throw new Error("Service Worker فعال نیست");
       }
@@ -777,20 +887,11 @@ window.connectSession = async function () {
 
       await Promise.race([ping, ready]).catch(() => {});
       if (!wasmReady) {
-        // آخرین فرصت: اگر broadcast از دست رفت، وضعیت را مستقیماً بخوان
-        try {
-          const status = await new Promise((resolve) => {
-            const channel = new MessageChannel();
-            channel.port1.onmessage = (e) => resolve(e.data);
-            sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
-          });
-          if (status?.wasmLoaded) {
-            wasmReady = true;
-            setDot("wasm", "ok", "Wasm آماده");
-            updateConnectButton();
-          }
-        } catch (_) {
-          // نادیده گرفته شود؛ خطای اصلی پایین‌تر ارسال می‌شود
+        // آخرین فرصت: اگر broadcast از دست رفت، وضعیت را مستقیماً بخوان.
+        // این درخواست timeout دارد و نمیتواند connect را برای همیشه قفل کند.
+        const status = await requestServiceWorkerStatus(sw, 1500);
+        if (status?.wasmLoaded || status?.wasmReady) {
+          markWasmReady();
         }
       }
       if (!wasmReady) {
@@ -811,6 +912,7 @@ window.connectSession = async function () {
     setBanner("🛡️", "متصل و ایمن", "connected");
     $("btn-destroy").disabled = false;
     $("btn-connect").textContent = "🔄 تجدید Session";
+    updateConnectButton();
 
     log("سیستم Ghost آماده است. ترافیک intercept می‌شود.", "ok");
 
@@ -821,7 +923,7 @@ window.connectSession = async function () {
     log(`خطا در اتصال: ${err.message}`, "error");
     setDot("session", "error", "خطا در ساخت");
     setBanner("❌", "خطا در اتصال", "error");
-    $("btn-connect").disabled = false;
+    updateConnectButton();
   }
 };
 
@@ -829,19 +931,29 @@ window.connectSession = async function () {
 //  Public: بروزرسانی وضعیت
 // ──────────────────────────────────────────────────────────────
 window.refreshStatus = async function () {
-  const sw = swRegistration?.active;
+  const sw = swRegistration?.active || navigator.serviceWorker.controller;
   if (!sw) {
     log("Service Worker فعال نیست.", "warn");
+    updateConnectButton();
     return;
   }
 
-  const status = await new Promise((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = (e) => resolve(e.data);
-    sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
-  });
+  const status = await requestServiceWorkerStatus(sw, 1500);
+  if (!status) {
+    log("پاسخی از Service Worker دریافت نشد.", "error");
+    updateConnectButton();
+    return;
+  }
 
-  log(`وضعیت: Router=${status.routerReady}, Session=${status.hasSession}, Wasm=${status.wasmLoaded}`, "info");
+  log(
+    `وضعیت: Router=${status.routerReady}, Session=${status.hasSession}, Wasm=${status.wasmLoaded}`,
+    "info"
+  );
+
+  if (status.wasmLoaded || status.wasmReady) {
+    markWasmReady("Wasm آماده");
+  }
+  updateConnectButton();
 
   if (status.sessionStats) {
     const stats = JSON.parse(status.sessionStats);
@@ -862,8 +974,8 @@ window.destroySession = function () {
   setDot("session", "error", "destroyed");
   setBanner("🗑️", "Session از بین رفت", "error");
   $("btn-destroy").disabled = true;
-  $("btn-connect").disabled = false;
   $("btn-connect").textContent = "🔗 اتصال مجدد";
+  updateConnectButton();
 
   $("metric-requests").textContent = "—";
   stopStatsRefresh();
@@ -889,36 +1001,42 @@ function stopStatsRefresh() {
 // ──────────────────────────────────────────────────────────────
 //  پیام‌های دریافتی از Service Worker
 // ──────────────────────────────────────────────────────────────
-navigator.serviceWorker.addEventListener("message", (event) => {
-  const { type, version } = event.data || {};
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const { type, version, error, stage } = event.data || {};
 
-  if (type === "WASM_READY") {
-    wasmReady = true;
-    log("Wasm ماژول در Service Worker لود شد.", "ok");
-    setDot("wasm", "ok", "Wasm آماده");
-    updateConnectButton();
-    return;
-  }
+    if (type === "WASM_READY") {
+      markWasmReady("Wasm آماده");
+      return;
+    }
 
-  if (type === "GHOST_READY") {
-    log(`Service Worker آماده — v${version}`, "ok");
-    setDot("wasm", "ok", "Router load شد");
-    updateConnectButton();
-  }
+    if (type === "GHOST_READY") {
+      // GHOST_READY یعنی Wasm نیز حتماً لود شده است؛ اگر WASM_READY گم شده
+      // بود، این پیام دکمه Connect را آزاد میکند.
+      markWasmReady("Router load شد");
+      log(`Service Worker آماده — v${version}`, "ok");
+      return;
+    }
 
-  if (type === "WASM_FAILED") {
-    log("❌ Wasm ماژول در Service Worker لود نشد. لطفاً صفحه را رفرش کنید.", "error");
-    setDot("wasm", "error", "Wasm خطا");
-    setBanner("❌", "Wasm لود نشد", "error");
-    updateConnectButton();
-  }
-});
+    if (type === "WASM_FAILED") {
+      console.error("[Ghost] Service Worker reported WASM_FAILED:", error || "unknown error");
+      reportWasmFailure();
+      return;
+    }
+
+    if (type === "GHOST_ERROR") {
+      const stageLabel = stage === "config" ? "دریافت Config" : "Router";
+      log(`خطای ${stageLabel} در Service Worker: ${error || "unknown error"}`, "error");
+    }
+  });
+}
 
 // ──────────────────────────────────────────────────────────────
 //  beforeunload — Destroy Session هنگام بستن tab
 // ──────────────────────────────────────────────────────────────
 window.addEventListener("beforeunload", () => {
-  const sw = swRegistration?.active;
+  const sw = swRegistration?.active ||
+    ("serviceWorker" in navigator ? navigator.serviceWorker.controller : null);
   if (sw) {
     // sendBeacon برای اطمینان از ارسال حتی در حین unload
     // اما چون ارتباط با SW است، از postMessage استفاده می‌کنیم
@@ -930,10 +1048,15 @@ window.addEventListener("beforeunload", () => {
 // ──────────────────────────────────────────────────────────────
 //  Init on load
 // ──────────────────────────────────────────────────────────────
+// شروع شمارش ۵ ثانیه از زمان اجرای UI — مستقل از register/activate/status.
+armWasmLoadFailSafe();
+
 document.addEventListener("DOMContentLoaded", async () => {
   log(`SCP-GHOST UI v${SW_VERSION} بارگذاری شد.`, "info");
   await registerServiceWorker();
-  log("برای شروع، دکمه «اتصال و Init Session» را بفشارید.", "muted");
+  if (wasmReady) {
+    log("برای شروع، دکمه «اتصال و Init Session» را بفشارید.", "muted");
+  }
 });
 </script>
 </body>
