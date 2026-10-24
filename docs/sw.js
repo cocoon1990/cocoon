@@ -21,9 +21,9 @@
 //
 //  import() پویا روی ServiceWorkerGlobalScope طبق مشخصات مسدود است؛
 //  حتی در یک Module Service Worker هم باید از import ایستا استفاده کرد.
-//  ?v=5.1.4 همچنین کشِ شکستِ import پویای نسخه قبل را دور میزند.
+//  ?v=5.2.0 همچنین کشِ نسخه‌های قبلی را دور می‌زند.
 // ──────────────────────────────────────────────────────────────
-import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.1.4";
+import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.2.0";
 
 // ──────────────────────────────────────────────────────────────
 //  Endpoint URLs — توسط deploy-pages.yml در زمان build inject می‌شوند
@@ -34,9 +34,9 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 //  Constants
 // ──────────────────────────────────────────────────────────────
-const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.1.4"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
+const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.2.0"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.1.4";   // 5.1.4: جایگزینی import پویا با import ایستا
+const SW_VERSION        = "5.2.0";   // 5.2.0: test-tunnel در UI + import ایستا
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
