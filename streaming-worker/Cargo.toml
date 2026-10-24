@@ -1,6 +1,6 @@
 [package]
 name         = "ghost-streaming-worker"
-version      = "5.2.6"
+version      = "5.4.0"
 edition      = "2021"
 rust-version = "1.91"
 
@@ -15,6 +15,9 @@ hex         = "0.4"
 base64      = "0.22"
 hmac        = "0.12"
 sha2        = "0.10"
+# ── VLESS over WebSocket (پمپ دوطرفه) ─────────────────────────
+futures-util = "0.3"
+tokio        = { version = "1", default-features = false, features = ["io-util"] }
 
 [profile.release]
 opt-level     = "z"

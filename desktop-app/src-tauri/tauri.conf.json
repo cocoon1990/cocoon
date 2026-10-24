@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SCP-GHOST",
-  "version": "5.3.0",
+  "version": "5.4.0",
   "identifier": "io.cocoon.scpghost",
   "build": {
     "frontendDist": "../src"
@@ -12,15 +12,12 @@
       {
         "label": "main",
         "title": "SCP-GHOST",
-        "width": 660,
-        "height": 880,
-        "minWidth": 480,
-        "minHeight": 600,
+        "width": 640,
+        "height": 900,
+        "minWidth": 520,
+        "minHeight": 620,
         "resizable": true,
-        "fullscreen": false,
-        "center": true,
-        "theme": "Dark",
-        "backgroundColor": "#0b0d12"
+        "center": true
       }
     ],
     "security": {
@@ -29,26 +26,41 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "targets": [
+      "nsis",
+      "msi"
+    ],
     "publisher": "Cocoon",
     "copyright": "© 2026 Cocoon",
-    "category": "Utility",
-    "shortDescription": "SCP-GHOST tunnel client (mihomo-compatible core)",
-    "longDescription": "Desktop controller for the SCP-GHOST tunnel. Ships the meow proxy core (mihomo-compatible, Rust) as a sidecar and drives it with a config built from the VLESS subscription.",
-    "externalBin": ["binaries/meow"],
+    "category": "utility",
+    "shortDescription": "SCP-GHOST — invisible-in-invisible VLESS tunnel",
+    "longDescription": "SCP-GHOST is a desktop shell for the Cocoon-in-Cocoon VLESS tunnel. The UI is a controller; all networking runs in the bundled meow core.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
+    "externalBin": [
+      "binaries/meow"
+    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       },
       "nsis": {
-        "installMode": "currentUser",
-        "displayLanguageSelector": false
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/cocoon1990/cocoon/releases/latest/download/latest.json"
+      ],
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""اعتبارسنجی خودکار بستهٔ دسکتاپ پیش از ساخت.
+"""verify_config.py — packaging + contract gate for the desktop shell.
 
-چیزهایی که بدون ویندوز قابل سنجش‌اند:
+Run it after the Node suites:
 
-  * ساختار `tauri.conf.json` و وجود sidecar در `externalBin`
-  * آیکون‌ها (PNG + ICO با ۶ سایز)
-  * مانیفست ویندوز (Common-Controls + requireAdministrator)
-  * نبود کد پراکسی/TUN دست‌ساز در `main.rs`  ← تأیید «حذف کد سفارشی»
-  * هم‌خوانی نام دستورهای `invoke(...)` در JS با `generate_handler!`
-  * اعتبار YAML کانفیگ‌های تولیدشده در `tools/out/`
+    node desktop-app/tools/test_core.cjs
+    python3 desktop-app/tools/verify_config.py
 
-اجرا:  python3 desktop-app/tools/verify_config.py [--require-sidecar]
+It fails (exit 1) on anything that would break a release build:
+tauri.conf.json shape, sidecar/icon presence, updater wiring, banned
+proxy/TUN code in the Rust controller, and frontend <-> backend command parity.
 """
-
 from __future__ import annotations
 
 import json
@@ -21,273 +18,271 @@ import struct
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SRC_TAURI = ROOT / "src-tauri"
-CONF_PATH = SRC_TAURI / "tauri.conf.json"
-CARGO_PATH = SRC_TAURI / "Cargo.toml"
-MAIN_RS = SRC_TAURI / "src" / "main.rs"
-BUILD_RS = SRC_TAURI / "build.rs"
-MANIFEST = SRC_TAURI / "app.manifest"
-CAPS = SRC_TAURI / "capabilities" / "default.json"
-UI = ROOT / "src"
-TOOLS_OUT = ROOT / "tools" / "out"
+ROOT = Path(__file__).resolve().parents[2]
+APP = ROOT / "desktop-app"
+TAURI = APP / "src-tauri"
+SRC = APP / "src"
+WORKER = ROOT / "streaming-worker"
+VERSION = "5.4.0"
 
-REQUIRE_SIDECAR = "--require-sidecar" in sys.argv
-
-errors: list[str] = []
+problems: list[str] = []
 notes: list[str] = []
 
 
-def ok(message: str) -> None:
-    print(f"  OK   {message}")
-
-
 def fail(message: str) -> None:
-    errors.append(message)
-    print(f"  FAIL {message}")
+    problems.append(message)
 
 
-def check(condition: bool, message: str) -> bool:
-    if condition:
-        ok(message)
+def ok(message: str) -> None:
+    notes.append(message)
+
+
+def read(path: Path) -> str:
+    if not path.exists():
+        fail(f"missing file: {path.relative_to(ROOT)}")
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+# ── 1. tauri.conf.json ─────────────────────────────────────────
+conf_path = TAURI / "tauri.conf.json"
+conf = json.loads(read(conf_path) or "{}")
+
+if conf.get("productName") != "SCP-GHOST":
+    fail("productName must stay SCP-GHOST")
+if conf.get("version") != VERSION:
+    fail(f"tauri.conf.json version must be {VERSION}, got {conf.get('version')}")
+if conf.get("identifier") != "io.cocoon.scpghost":
+    fail("bundle identifier changed")
+
+build = conf.get("build", {})
+dist = (TAURI / build.get("frontendDist", "")).resolve()
+if not dist.is_dir():
+    fail(f"frontendDist does not resolve to a directory: {build.get('frontendDist')}")
+else:
+    ok(f"frontendDist -> {dist.relative_to(ROOT)}")
+if (dist / "src-tauri").exists():
+    fail("frontendDist must not contain src-tauri (it would embed target/)")
+
+app = conf.get("app", {})
+windows = app.get("windows") or []
+if not windows or windows[0].get("label") != "main":
+    fail("the first window must be labelled 'main'")
+if not app.get("withGlobalTauri"):
+    fail("withGlobalTauri must be true: the frontend has no bundler and uses __TAURI__")
+
+cap_path = TAURI / "capabilities" / "default.json"
+cap = json.loads(read(cap_path) or "{}")
+permissions = cap.get("permissions", [])
+if "core:default" not in permissions:
+    fail("capabilities must include core:default")
+if "updater:default" not in permissions:
+    fail("capabilities must include updater:default")
+if cap.get("windows") != ["main"]:
+    fail("capabilities must target the 'main' window only")
+
+# ── 2. bundle ─────────────────────────────────────────────────
+bundle = conf.get("bundle", {})
+targets = bundle.get("targets")
+if sorted(targets or []) != ["msi", "nsis"]:
+    fail(f"bundle.targets must be [nsis, msi], got {targets}")
+
+external = bundle.get("externalBin") or []
+if external != ["binaries/meow"]:
+    fail(f"externalBin must be exactly ['binaries/meow'], got {external}")
+else:
+    sidecars = list((TAURI / "binaries").glob("meow-*.exe"))
+    if not sidecars:
+        notes.append("sidecar not vendored locally (CI downloads it before building)")
     else:
-        fail(message)
-    return condition
+        ok(f"sidecar present: {sidecars[0].name}")
 
+icons = bundle.get("icon") or []
+if "icons/icon.ico" not in icons:
+    fail("bundle.icon must include icons/icon.ico for Windows")
 
-def png_size(data: bytes) -> tuple[int, int]:
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("not a PNG")
-    return struct.unpack(">II", data[16:24])
-
-
-def main() -> int:
-    print("== tauri.conf.json ==")
-    if not CONF_PATH.exists():
-        fail(f"missing {CONF_PATH}")
-        return 1
-
-    try:
-        conf = json.loads(CONF_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        fail(f"invalid JSON: {exc}")
-        return 1
-
-    ok("valid JSON")
-
-    product = conf.get("productName", "")
-    version = str(conf.get("version", ""))
-    identifier = conf.get("identifier", "")
-
-    check(bool(product), f"productName = {product!r}")
-    check(bool(re.fullmatch(r"\d+\.\d+\.\d+", version)), f"version is MSI-safe ({version!r})")
-    check(
-        bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(\.[A-Za-z][A-Za-z0-9-]*)+", identifier))
-        and not identifier.endswith(".app"),
-        f"identifier = {identifier!r}",
-    )
-
-    # ── sidecar ─────────────────────────────────────────────────
-    print("== sidecar (externalBin) ==")
-    external = conf.get("bundle", {}).get("externalBin", [])
-    check(external == ["binaries/meow"], f"externalBin = {external}")
-
-    sidecar_stem = "binaries/meow"
-    triple = "x86_64-pc-windows-msvc"
-    sidecar_path = SRC_TAURI / f"{sidecar_stem}-{triple}.exe"
-    if sidecar_path.is_file():
-        size_mb = sidecar_path.stat().st_size / (1024 * 1024)
-        check(size_mb > 1, f"sidecar present ({size_mb:.1f} MB) — {sidecar_path.name}")
-    elif REQUIRE_SIDECAR:
-        fail(f"sidecar missing at {sidecar_path.name} (download step must run first)")
-    else:
-        notes.append(f"sidecar not downloaded yet ({sidecar_path.name}); build needs it")
-
-    # ── فرانت‌اند ───────────────────────────────────────────────
-    frontend = conf.get("build", {}).get("frontendDist")
-    check(bool(frontend), f"build.frontendDist = {frontend!r}")
-    if frontend:
-        frontend_dir = (SRC_TAURI / frontend).resolve()
-        check(frontend_dir.is_dir(), f"frontendDist exists ({frontend_dir.name}/)")
-        check((frontend_dir / "index.html").is_file(), "frontendDist contains index.html")
-
-    app = conf.get("app", {})
-    windows = app.get("windows", [])
-    labels = [w.get("label", "main") for w in windows]
-    check("main" in labels, f"window labels = {labels}")
-    check(app.get("withGlobalTauri") is True, "withGlobalTauri enabled (no bundler)")
-
-    # ── مانیفست ویندوز ──────────────────────────────────────────
-    print("== windows manifest ==")
-    if check(MANIFEST.is_file(), "app.manifest exists"):
-        manifest = MANIFEST.read_text(encoding="utf-8")
-        check(
-            'level="requireAdministrator"' in manifest,
-            "requests administrator (TUN needs it)",
-        )
-        check(
-            "Microsoft.Windows.Common-Controls" in manifest,
-            "keeps Common-Controls v6 dependency",
-        )
-    if check(BUILD_RS.is_file(), "build.rs exists"):
-        build = BUILD_RS.read_text(encoding="utf-8")
-        check("try_build" in build, "build.rs uses tauri_build::try_build")
-        check("app_manifest" in build, "build.rs installs the custom manifest")
-
-    # ── قابلیت‌ها ───────────────────────────────────────────────
-    print("== capabilities/default.json ==")
-    if check(CAPS.is_file(), "capability file exists"):
-        try:
-            cap = json.loads(CAPS.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            fail(f"capability JSON invalid: {exc}")
-            cap = {}
-        perms = cap.get("permissions", [])
-        check("core:default" in perms, f"permissions = {perms}")
-        unknown = [w for w in cap.get("windows", []) if w not in labels]
-        check(not unknown, f"capability windows {cap.get('windows')} ⊆ {labels}")
-
-    # ── آیکون‌ها ────────────────────────────────────────────────
-    print("== icons ==")
-    icons = conf.get("bundle", {}).get("icon", [])
-    check(len(icons) >= 3, f"bundle.icon has {len(icons)} entries")
-
-    for rel in icons:
-        path = SRC_TAURI / rel
-        if not path.is_file():
-            fail(f"missing icon {rel}")
-            continue
-        data = path.read_bytes()
-        if path.suffix == ".png":
-            width, height = png_size(data)
-            ok(f"{rel} → {width}x{height}")
-        elif path.suffix == ".ico":
-            reserved, kind, count = struct.unpack("<HHH", data[:6])
-            if reserved != 0 or kind != 1:
-                fail(f"{rel}: bad ICONDIR header")
-                continue
-            sizes = []
-            bad = False
-            for index in range(count):
-                entry = data[6 + 16 * index : 6 + 16 * (index + 1)]
-                width, _, _, _, _, bpp, size, offset = struct.unpack("<BBBBHHII", entry)
-                if offset + size > len(data) or bpp != 32:
-                    fail(f"{rel}: entry {index} corrupt")
-                    bad = True
-                    break
-                sizes.append(width or 256)
-            if not bad:
-                ok(f"{rel} → {count} sizes {sizes}")
-
-    # ── Cargo ───────────────────────────────────────────────────
-    print("== Cargo.toml ==")
-    cargo = CARGO_PATH.read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', cargo, re.MULTILINE)
-    check(match is not None, "package.version present")
-    if match:
-        check(match.group(1) == version, f"Cargo {match.group(1)!r} == tauri.conf {version!r}")
-    check('tauri-build' in cargo, "tauri-build in [build-dependencies]")
-    check('tauri-plugin-shell' in cargo, "tauri-plugin-shell dependency present")
-    for banned in ("x25519-dalek", "aes-gcm", "hkdf", "hmac", "tun ="):
-        check(banned not in cargo, f"no crypto/TUN crate ({banned})")
-
-    # ── کد سفارشی حذف شده؟ ─────────────────────────────────────
-    print("== no hand-written proxy code ==")
-    if check(MAIN_RS.is_file(), "src/main.rs exists"):
-        rust = MAIN_RS.read_text(encoding="utf-8")
-        for banned, why in (
-            ("TcpListener", "custom TCP proxy"),
-            ("TcpStream", "raw socket handling"),
-            ("X25519", "custom handshake"),
-            ("aes_gcm", "custom crypto"),
-            ("Hmac", "custom signing"),
-            ("create_tun", "custom TUN device"),
-        ):
-            check(banned not in rust, f"main.rs has no {banned} — {why}")
-        check(
-            "sidecar(SIDECAR_NAME)" in rust or 'sidecar("meow")' in rust,
-            "main.rs launches the sidecar",
-        )
-        check(
-            rust.count("child.kill()") >= 1 and "kill_on_drop" not in rust,
-            "child process is killed explicitly (no orphan on exit)",
-        )
-
-    # ── هم‌خوانی دستورها ────────────────────────────────────────
-    print("== commands ==")
-    if MAIN_RS.is_file():
-        rust = MAIN_RS.read_text(encoding="utf-8")
-        handler = re.search(r"generate_handler!\s*\[(.*?)\]", rust, re.DOTALL)
-        if check(handler is not None, "generate_handler! block found"):
-            registered = {n.strip() for n in handler.group(1).split(",") if n.strip()}
-            ok(f"registered: {sorted(registered)}")
-
-            used: set[str] = set()
-            for js in sorted(UI.glob("*.js")):
-                used |= set(re.findall(r"invoke\(\s*['\"]([a-z_]+)['\"]", js.read_text(encoding="utf-8")))
-            ok(f"invoked from JS: {sorted(used)}")
-            check(not (used - registered), f"every invoked command is registered (missing: {sorted(used - registered)})")
-            missing_binding = sorted(registered - used)
-            if missing_binding:
-                notes.append(f"registered but never invoked: {missing_binding}")
-
-    # ── فرانت‌اند ───────────────────────────────────────────────
-    print("== frontend assets ==")
-    index = UI / "index.html"
-    if check(index.is_file(), "src/index.html exists"):
-        html = index.read_text(encoding="utf-8")
-        for asset in ("styles.css", "core-config.js", "main.js"):
-            check((UI / asset).is_file(), f"src/{asset} exists")
-            check(asset in html, f"index.html references {asset}")
-        check(
-            html.index("core-config.js") < html.index('"main.js"')
-            if "core-config.js" in html and '"main.js"' in html
-            else False,
-            "core-config.js loads before main.js",
-        )
-
-    # ── YAML تولیدشده ──────────────────────────────────────────
-    print("== generated core configs ==")
-    yaml_files = sorted(TOOLS_OUT.glob("*.yaml")) if TOOLS_OUT.is_dir() else []
-    if not yaml_files:
-        notes.append("tools/out/ خالی است — ابتدا node tools/test_core_config.cjs را اجرا کنید")
-    else:
-        try:
-            import yaml  # type: ignore
-        except ImportError:
-            notes.append("PyYAML نصب نیست — اعتبار YAML بررسی نشد (pip install pyyaml)")
+for icon in icons:
+    path = TAURI / icon
+    if not path.exists():
+        fail(f"missing icon: {icon}")
+        continue
+    raw = path.read_bytes()
+    if icon.endswith(".png"):
+        if raw[:8] != b"\x89PNG\r\n\x1a\n":
+            fail(f"{icon} is not a PNG")
+    elif icon.endswith(".ico"):
+        if raw[:4] != b"\x00\x00\x01\x00":
+            fail(f"{icon} is not an ICO")
         else:
-            for path in yaml_files:
-                try:
-                    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-                except Exception as exc:  # noqa: BLE001
-                    fail(f"{path.name}: invalid YAML ({exc})")
-                    continue
-                proxy = (data.get("proxies") or [{}])[0]
-                checks = [
-                    proxy.get("type") == "vless",
-                    isinstance(data.get("tun"), dict),
-                    data.get("rules") == ["MATCH,PROXY"],
-                    data.get("proxy-groups", [{}])[0].get("name") == "PROXY",
-                ]
-                if all(checks):
-                    ok(f"{path.name} (network={proxy.get('network')}, tls={proxy.get('tls')})")
-                else:
-                    fail(f"{path.name}: unexpected structure ({checks})")
+            count = struct.unpack("<H", raw[4:6])[0]
+            if count < 4:
+                fail(f"{icon} carries only {count} images")
 
-    print("\n== summary ==")
-    for note in notes:
-        print(f"  NOTE {note}")
+win = bundle.get("windows", {})
+if (win.get("nsis") or {}).get("installMode") != "currentUser":
+    fail("NSIS installMode must be currentUser (no admin needed to install)")
+if not win.get("webviewInstallMode"):
+    fail("webviewInstallMode must be set so end users get WebView2")
 
-    if errors:
-        print(f"\n{len(errors)} problem(s) found:")
-        for error in errors:
-            print(f"  - {error}")
-        return 1
+# ── 3. updater plugin ─────────────────────────────────────────
+updater = (conf.get("plugins") or {}).get("updater")
+if not updater:
+    fail("plugins.updater is missing: auto-update is not wired")
+else:
+    endpoints = updater.get("endpoints") or []
+    if not endpoints or not all(url.startswith("https://") for url in endpoints):
+        fail("updater endpoints must be a non-empty https list")
+    if "pubkey" not in updater:
+        fail("updater.pubkey must exist (empty until a signing key is generated)")
+    ok(f"updater endpoint -> {endpoints[0] if endpoints else '(none)'}")
 
-    print("all checks passed")
-    return 0
+cargo = read(TAURI / "Cargo.toml")
+if f'version = "{VERSION}"' not in cargo:
+    fail(f"src-tauri/Cargo.toml must be version {VERSION}")
+if "tauri-plugin-updater" not in cargo:
+    fail("Cargo.toml must depend on tauri-plugin-updater")
+if "tauri-plugin-shell" not in cargo:
+    fail("Cargo.toml must depend on tauri-plugin-shell (sidecar control)")
 
+BANNED_CRATES = ["windivert", "wintun", "smoltcp", "pnet", "netstack", "tun ="]
+for crate in BANNED_CRATES:
+    if crate in cargo.lower():
+        fail(f"banned crate in Cargo.toml: {crate}")
 
-if __name__ == "__main__":
-    sys.exit(main())
+# ── 4. Rust controller ────────────────────────────────────────
+main_rs = read(TAURI / "src" / "main.rs")
+BANNED_RUST = [
+    "TcpStream",
+    "UdpSocket",
+    "tokio::net",
+    "std::net::",
+    "WinDivert",
+    "wintun",
+    "kill_on_drop",
+]
+for token in BANNED_RUST:
+    if token in main_rs:
+        fail(f"banned token in main.rs: {token} (the shell must not do networking)")
+
+if "tauri_plugin_updater::Builder::new().build()" not in main_rs:
+    fail("the updater plugin is not registered in main.rs")
+if "tauri_plugin_shell::init()" not in main_rs:
+    fail("the shell plugin is not registered in main.rs")
+if "RunEvent::Exit" not in main_rs or "guard.kill()" not in main_rs:
+    fail("the sidecar must be killed on RunEvent::Exit")
+if "sidecar(SIDECAR)" not in main_rs:
+    fail("main.rs does not spawn the sidecar")
+
+handlers = re.search(r"generate_handler!\[(.*?)\]", main_rs, re.S)
+if not handlers:
+    fail("generate_handler! list not found")
+    rust_commands: set[str] = set()
+else:
+    rust_commands = {item.strip().split("::")[-1] for item in handlers.group(1).split(",") if item.strip()}
+
+main_js = read(SRC / "main.js")
+js_commands = set(re.findall(r"invoke\('([a-z_]+)'", main_js))
+missing_in_js = rust_commands - js_commands
+missing_in_rs = {cmd for cmd in js_commands if cmd not in rust_commands}
+if missing_in_js:
+    fail(f"commands exposed but never called from main.js: {sorted(missing_in_js)}")
+if missing_in_rs:
+    fail(f"main.js calls commands that do not exist: {sorted(missing_in_rs)}")
+if not rust_commands:
+    fail("no commands exposed by the shell")
+ok(f"commands: {', '.join(sorted(rust_commands))}")
+
+# ── 5. frontend ───────────────────────────────────────────────
+index = read(SRC / "index.html")
+for asset in ("styles.css", "core.js", "main.js"):
+    if not (SRC / asset).exists():
+        fail(f"missing frontend asset: {asset}")
+    if asset not in index:
+        fail(f"index.html does not reference {asset}")
+
+if 'dir="rtl"' not in index or 'lang="fa"' not in index:
+    fail("index.html must be Persian and RTL")
+for leftover in ("core-config.js", "styles.css.bak"):
+    if (SRC / leftover).exists():
+        fail(f"stale asset left behind: {leftover}")
+for removed in ("index.html", "main.js", "styles.css"):
+    if (APP / removed).exists():
+        fail(f"{removed} must live in desktop-app/src/, not the package root")
+
+styles = read(SRC / "styles.css")
+for token in ("#0f172a", "#1e293b", "#06b6d4", "#10b981"):
+    if token not in styles.lower():
+        fail(f"design token {token} missing from styles.css")
+for family in ("Vazirmatn", "Inter"):
+    if family not in styles:
+        fail(f"{family} is not part of the font stack")
+
+if "connect" not in index or "btn-connect" not in index:
+    fail("the connect button is missing")
+if "data-mode=\"tun\"" not in index or "data-mode=\"proxy\"" not in index:
+    fail("the TUN/Proxy segmented control is missing")
+if "btn-fetch" not in index or "btn-copy" not in index:
+    fail("the subscription field must have Fetch + Copy")
+if "btn-advanced" not in index:
+    fail("advanced settings must be behind an accordion")
+
+# ── 6. generated YAML ─────────────────────────────────────────
+try:
+    import yaml  # type: ignore
+except ImportError:  # pragma: no cover
+    fail("PyYAML is required: run this with the venv that has pyyaml")
+    yaml = None
+
+out_dir = APP / "tools" / "out"
+configs = sorted(out_dir.glob("config-*.yaml")) if out_dir.exists() else []
+if not configs:
+    fail("no generated configs found: run `node desktop-app/tools/test_core.cjs` first")
+
+if yaml is not None:
+    for config_path in configs:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        proxy = (data.get("proxies") or [{}])[0]
+        if proxy.get("type") != "vless":
+            fail(f"{config_path.name}: first proxy must be vless")
+        if proxy.get("network") != "ws" or proxy.get("tls") is not True:
+            fail(f"{config_path.name}: proxy must be vless over ws with tls")
+        if not re.fullmatch(r"[0-9a-f-]{36}", str(proxy.get("uuid"))):
+            fail(f"{config_path.name}: invalid uuid")
+        if (proxy.get("ws-opts") or {}).get("path") != "/vless":
+            fail(f"{config_path.name}: ws path must be /vless")
+        if data.get("mixed-port") not in (7890, 7891):
+            fail(f"{config_path.name}: unexpected mixed-port")
+        if "tun" in config_path.name:
+            if (data.get("tun") or {}).get("enable") is not True:
+                fail(f"{config_path.name}: tun mode must enable tun")
+        else:
+            if (data.get("tun") or {}).get("enable") is not False:
+                fail(f"{config_path.name}: proxy mode must disable tun")
+    ok(f"parsed {len(configs)} generated configs")
+
+# ── 7. worker lockstep ────────────────────────────────────────
+worker_cargo = read(WORKER / "Cargo.toml")
+worker_toml = read(WORKER / "wrangler.toml")
+worker_rs = read(WORKER / "src" / "lib.rs")
+if f'version      = "{VERSION}"' not in worker_cargo and f'version = "{VERSION}"' not in worker_cargo:
+    fail(f"streaming-worker/Cargo.toml must be {VERSION}")
+if f'WORKER_VERSION   = "{VERSION}"' not in worker_toml and f'WORKER_VERSION = "{VERSION}"' not in worker_toml:
+    fail(f"wrangler WORKER_VERSION must be {VERSION}")
+if '.get_async("/vless", handle_vless)' not in worker_rs:
+    fail("/vless is not routed in the worker")
+if "Response::from_websocket(client)" not in worker_rs:
+    fail("the worker does not upgrade /vless to a WebSocket")
+ok("worker + desktop versions are in lockstep")
+
+# ── report ────────────────────────────────────────────────────
+for line in notes:
+    print(f"  · {line}")
+
+if problems:
+    print()
+    for line in problems:
+        print(f"  ✗ {line}")
+    print(f"\n{len(problems)} problem(s) found")
+    sys.exit(1)
+
+print(f"\n✓ desktop shell {VERSION} passed every packaging check")

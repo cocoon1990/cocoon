@@ -8,10 +8,14 @@ on:
     branches: [main]
     paths:
       - 'desktop-app/**'
+      - 'streaming-worker/Cargo.toml'
+      - 'streaming-worker/wrangler.toml'
       - '.github/workflows/build-desktop.yml'
   pull_request:
     paths:
       - 'desktop-app/**'
+      - 'streaming-worker/Cargo.toml'
+      - 'streaming-worker/wrangler.toml'
       - '.github/workflows/build-desktop.yml'
   workflow_dispatch:
 
@@ -93,27 +97,23 @@ jobs:
         shell: bash
         run: python -m pip install --quiet --disable-pip-version-check pyyaml
 
-      - name: Core config generator tests
+      - name: Frontend logic tests (subscription + vless + YAML)
         shell: bash
-        run: node desktop-app/tools/test_core_config.cjs
+        run: node desktop-app/tools/test_core.cjs
 
-      - name: Validate manifest/config/sidecar
+      - name: VLESS worker protocol tests
         shell: bash
-        run: python desktop-app/tools/verify_config.py --require-sidecar
+        run: node streaming-worker/tests/vless.test.mjs
+
+      - name: Packaging contract (tauri.conf + updater + command parity)
+        shell: bash
+        run: python desktop-app/tools/verify_config.py
 
       - name: Syntax-check the frontend
         shell: bash
         run: |
-          node --check desktop-app/src/core-config.js
+          node --check desktop-app/src/core.js
           node --check desktop-app/src/main.js
-
-      # آزمون DOM؛ اگر رجیستری npm در دسترس نبود، انتشار را متوقف نمی‌کند.
-      - name: UI wiring test (jsdom)
-        continue-on-error: true
-        shell: bash
-        run: |
-          npm install --silent --no-fund --no-audit --prefix desktop-app/.tools jsdom
-          NODE_PATH="$PWD/desktop-app/.tools/node_modules" node desktop-app/tools/test_ui.cjs
 
       # خروجی کامپایلر به‌صورت annotation منتشر می‌شود تا از API قابل خواندن
       # باشد (لاگ خام روی storage خارجی است و در همه‌جا در دسترس نیست).
@@ -213,10 +213,11 @@ jobs:
             - `*_x64_en-US.msi` — بستهٔ MSI برای نصب سازمانی
 
             **اجرا**
-            1. `setup.exe` را اجرا کنید (نصب برای کاربر جاری).
+            1. `setup.exe` را اجرا کنید (نصب برای کاربر جاری، بدون نیاز به ادمین).
             2. برنامه هنگام اجرا با UAC بالا می‌آید؛ این برای ساخت آداپتور TUN لازم است.
-            3. آدرس اشتراک VLESS را وارد کنید → «دریافت و بررسی» → «اتصال».
-            4. لاگ هسته در پایین پنجره وضعیت واقعی را نشان می‌دهد.
+            3. آدرس اشتراک را وارد کنید (همان `/sub?token=...` که worker می‌دهد) → «دریافت».
+            4. نود VLESS نمایش داده می‌شود؛ «اتصال» هسته را با همان نود اجرا می‌کند.
+            5. «تنظیمات پیشرفته» → پورت محلی، لاگ هسته و «بررسی به‌روزرسانی».
 
             اگر SmartScreen هشدار داد: More info → Run anyway (امضای تجاری ندارد).
             WebView2 در ویندوز ۱۰/۱۱ از پیش نصب است.

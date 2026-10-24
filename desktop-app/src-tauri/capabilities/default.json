@@ -1,6 +1,11 @@
 {
   "identifier": "default",
-  "description": "حداقل دسترسی‌های لازم برای پنجرهٔ اصلی برنامه",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "حداقل دسترسی‌های لازم برای پنجرهٔ اصلی برنامه + بررسی به‌روزرسانی",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "updater:default"
+  ]
 }
