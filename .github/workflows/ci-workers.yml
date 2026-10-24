@@ -302,10 +302,11 @@ jobs:
 
           mk() {
             NAME="$1"; FILE="$2"; DATE="$3"; EXTRA="$4"
+            CFG="wrangler.probe-$NAME.toml"
             printf 'name = "%s"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "%s"\n%s\n' \
-              "$NAME" "$DATE" "$EXTRA" > "$FILE"
+              "$NAME" "$DATE" "$EXTRA" > "$CFG"
             set +e
-            npx --yes wrangler@latest deploy -c "$FILE" > "/tmp/d-$NAME.log" 2>&1
+            npx --yes wrangler@latest deploy -c "$CFG" > "/tmp/d-$NAME.log" 2>&1
             RC=$?
             set -e
             sleep 18
@@ -313,6 +314,9 @@ jobs:
               "https://$NAME.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
             printf 'D[%s] rc=%s health=%s body=%s\n' "$NAME" "$RC" "$CODE" \
               "$(head -c 60 /tmp/d-$NAME.body 2>/dev/null | tr '\n' ' ')" >> "$OUT"
+            if [ "$RC" != "0" ]; then
+              echo "  log: $(tail -n 3 /tmp/d-$NAME.log | tr '\n' ' ' | cut -c1-200)" >> "$OUT"
+            fi
           }
 
           KV='[[kv_namespaces]]\nbinding = "GHOST_CONFIG"\nid = "e9277d0612d04fae97e8d0d7ac6dc87d"'
@@ -322,6 +326,7 @@ jobs:
           mk ghost-streaming-kvonly   /tmp/wk.toml 2025-10-01 "$(printf "$KV")"
           mk ghost-streaming-doonly   /tmp/wd.toml 2025-10-01 "$(printf "$DO")"
           mk ghost-streaming-olddate  /tmp/wo.toml 2024-09-23 ""
+          rm -f wrangler.probe-*.toml
 
           MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-850)
           echo "::error title=probe-D-G::$MSG"
