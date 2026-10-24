@@ -270,6 +270,46 @@ jobs:
           echo "⚠️  Not failing the workflow — the deploy step already succeeded."
           exit 0
 
+      - name: "Deploy probe copy (same build, new name)"
+        if: always()
+        continue-on-error: true
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy --name ghost-streaming-probe
+          workingDirectory: streaming-worker
+
+      # ── تشخیص 1101: یک کپی از همان build با نام تازه ────────────
+      # Error 1101 روی *همهٔ* مسیرها (حتی /health) یعنی module پیش از
+      # routing می‌میرد. دو فرض رقیب وجود دارد: (۱) کد/وابستگی‌های تازه،
+      # (۲) گیر کردن خود اسکریپت در سمت Cloudflare. اگر همان build با
+      # نام تازه ۲۰۰ بدهد، فرض دوم درست است.
+      - name: "Probe: identical build under a fresh worker name"
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          HEALTH_URL: ${{ secrets.CF_STREAMING_URL }}
+        run: |
+          set -u
+          if [ -z "${HEALTH_URL:-}" ]; then echo "no CF_STREAMING_URL"; exit 0; fi
+          SUB=$(python3 -c "import os,urllib.parse as u;h=u.urlparse(os.environ['HEALTH_URL']).hostname or '';print(h.split('.',1)[1] if '.' in h else '')")
+          if [ -z "$SUB" ]; then echo "could not derive subdomain"; exit 0; fi
+          PROBE="ghost-streaming-probe.$SUB"
+          echo "probe target: https://$PROBE/health"
+          for attempt in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -o probe_body.txt -w '%{http_code}' --max-time 15 "https://$PROBE/health?cb=$GITHUB_RUN_ID" || echo 000)
+            echo "attempt $attempt -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "::warning title=Probe result::fresh name returns 200 — the deployed script is stuck at the edge, not a code bug"
+              cat probe_body.txt; exit 0
+            fi
+            sleep 10
+          done
+          BODY=$(head -c 300 probe_body.txt 2>/dev/null | tr '\n' ' ' | sed 's/%/%25/g')
+          echo "::warning title=Probe result::fresh name also returns $CODE — this is a code/dependency problem, not edge state. body: $BODY"
+          exit 0
+
   # ════════════════════════════════════════════════════════════
   #  Build و Deploy: Signaling Worker
   # ════════════════════════════════════════════════════════════
