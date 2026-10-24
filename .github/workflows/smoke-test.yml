@@ -4,22 +4,31 @@
 #  چرا این ورک‌فلو وجود دارد؟
 #  ورک‌فلوی deploy-workers یک health check دارد که عمداً هرگز fail
 #  نمی‌شود (failsafe برای propagation). یعنی هیچ تست واقعی روی
-#  رفتار endpointهای مستقر وجود ندارد. این ورک‌فلو آن شکاف را
-#  می‌بندد و *رفتار* (نه فقط build) را روی نسخهٔ مستقر بررسی می‌کند.
+#  *رفتار* endpointهای مستقر وجود ندارد. این ورک‌فلو آن شکاف را
+#  می‌بندد: بعد از هر deploy، نسخهٔ زنده را صدا می‌زند و رفتار
+#  واقعی را assert می‌کند.
 #
 #  اجرا:
-#    gh workflow run smoke-test.yml
+#    • خودکار: بعد از اتمام «Build & Deploy — Rust Workers»
+#    • دستی:  gh workflow run smoke-test.yml
 #
 #  هر بررسی یک step مستقل است، پس نتیجهٔ هرکدام در API قابل خواندن
 #  است (conclusion هر step) حتی وقتی لاگ قابل دانلود نباشد.
 #
-#  نکتهٔ امنیتی: مسیرها هرگز echo نمی‌شوند چون query آن‌ها شامل
-#  امضای HMAC است. فقط status code و هدرهای غیرحساس چاپ می‌شوند.
+#  نکتهٔ امنیتی: مسیرهای حاوی امضای HMAC هرگز echo نمی‌شوند.
+#  فقط status code و هدرهای غیرحساس چاپ می‌شود.
 # ══════════════════════════════════════════════════════════════
 name: "🧪 Smoke Test — Deployed Worker"
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ["⚙️ Build & Deploy — Rust Workers"]
+    types:
+      - completed
+  push:
+    branches:
+      - arena/ab2a38b7-cocoon
 
 permissions:
   contents: read
@@ -73,31 +82,28 @@ jobs:
           echo "status=$CODE"
           grep -i '^x-ghost-sub:' headers.txt || true
           GATE=$(grep -i '^x-ghost-sub:' headers.txt | tr -d '\r' | awk '{print $2}' | tr 'A-Z' 'a-z' || true)
+          echo "gate=$GATE"
 
           case "$GATE" in
             unconfigured|token-required|ok) ;;
             *) echo "::error::/sub is missing or not gated (X-Ghost-Sub=$GATE)"; exit 1 ;;
           esac
 
-          case "$GATE" in
-            ok)
-              [ "$CODE" = "200" ] || { echo "::error::gate=ok but status=$CODE"; exit 1; }
-              # بدنه باید Base64 معتبر از یک URI وی‌لِس باشد
-              base64 -d body.txt > decoded.txt 2>/dev/null || { echo "::error::body is not valid base64"; exit 1; }
-              head -c 8 decoded.txt | grep -q '^vless://' || { echo "::error::decoded subscription is not a vless URI"; exit 1; }
-              grep -q 'security=tls' decoded.txt || { echo "::error::subscription has no TLS"; exit 1; }
-              grep -q ':443' decoded.txt || { echo "::error::subscription is not on port 443"; exit 1; }
-              echo "✅ subscription is valid base64(vless://…:443, tls)"
-              ;;
-            token-required)
-              [ "$CODE" = "403" ] || { echo "::error::expected 403 for missing token, got $CODE"; exit 1; }
-              ;;
-            unconfigured)
-              [ "$CODE" = "503" ] || { echo "::error::expected 503 while unconfigured, got $CODE"; exit 1; }
-              grep -q 'subscription_not_configured' body.txt || { echo "::error::503 body lacks subscription_not_configured"; exit 1; }
-              echo "✅ /sub exists and refuses to emit a link until VLESS params are configured"
-              ;;
-          esac
+          if [ "$GATE" = "ok" ]; then
+            [ "$CODE" = "200" ] || { echo "::error::gate=ok but status=$CODE"; exit 1; }
+            base64 -d body.txt > decoded.txt 2>/dev/null || { echo "::error::body is not valid base64"; exit 1; }
+            head -c 8 decoded.txt | grep -q '^vless://' || { echo "::error::decoded subscription is not a vless URI"; exit 1; }
+            grep -q 'security=tls' decoded.txt || { echo "::error::subscription has no TLS"; exit 1; }
+            grep -q ':443' decoded.txt || { echo "::error::subscription is not on port 443"; exit 1; }
+            echo "✅ subscription is valid base64(vless://…:443, tls)"
+          elif [ "$GATE" = "token-required" ]; then
+            [ "$CODE" = "403" ] || { echo "::error::expected 403 for missing token, got $CODE"; exit 1; }
+            echo "✅ /sub refuses unauthenticated requests"
+          else
+            [ "$CODE" = "503" ] || { echo "::error::expected 503 while unconfigured, got $CODE"; exit 1; }
+            grep -q 'subscription_not_configured' body.txt || { echo "::error::503 body lacks subscription_not_configured"; exit 1; }
+            echo "✅ /sub exists and refuses to emit a link until VLESS params are configured"
+          fi
 
       # ── ۳. /stream بدون پارامتر → 400 (نه 500) ─────────────
       - name: "Stream: missing params → 400"
@@ -111,13 +117,7 @@ jobs:
         if: env.HMAC_SECRET != ''
         run: |
           TARGET='https://example.com/?probe=googlevideo.com'
-          read -r QS < <(python3 - "$TARGET" <<'PY'
-import hashlib, hmac, os, sys, urllib.parse
-target, seq = sys.argv[1], "0"
-sig = hmac.new(os.environ["HMAC_SECRET"].encode(), f"{target}:{seq}".encode(), hashlib.sha256).hexdigest()
-print("target=" + urllib.parse.quote(target, safe="") + "&sig=" + sig + "&seq=" + seq)
-PY
-)
+          QS=$(python3 -c 'import hashlib,hmac,os,sys,urllib.parse; t=sys.argv[1]; s="0"; sig=hmac.new(os.environ["HMAC_SECRET"].encode(), (t+":"+s).encode(), hashlib.sha256).hexdigest(); print("target="+urllib.parse.quote(t,safe="")+"&sig="+sig+"&seq="+s)' "$TARGET")
           CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/stream?$QS" || echo 000)
           echo "status=$CODE"
           cat body.txt 2>/dev/null || true
@@ -130,13 +130,7 @@ PY
         if: env.HMAC_SECRET != ''
         run: |
           TARGET='https://www.youtube.com/robots.txt'
-          read -r QS < <(python3 - "$TARGET" <<'PY'
-import hashlib, hmac, os, sys, urllib.parse
-target, seq = sys.argv[1], "1"
-sig = hmac.new(os.environ["HMAC_SECRET"].encode(), f"{target}:{seq}".encode(), hashlib.sha256).hexdigest()
-print("target=" + urllib.parse.quote(target, safe="") + "&sig=" + sig + "&seq=" + seq)
-PY
-)
+          QS=$(python3 -c 'import hashlib,hmac,os,sys,urllib.parse; t=sys.argv[1]; s="1"; sig=hmac.new(os.environ["HMAC_SECRET"].encode(), (t+":"+s).encode(), hashlib.sha256).hexdigest(); print("target="+urllib.parse.quote(t,safe="")+"&sig="+sig+"&seq="+s)' "$TARGET")
           CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 25 "$GHOST_BASE/stream?$QS" || echo 000)
           echo "status=$CODE"
           case "$CODE" in
