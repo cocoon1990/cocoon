@@ -23,7 +23,7 @@ APP = ROOT / "desktop-app"
 TAURI = APP / "src-tauri"
 SRC = APP / "src"
 WORKER = ROOT / "streaming-worker"
-VERSION = "5.4.0"
+VERSION = "5.4.1"
 
 problems: list[str] = []
 notes: list[str] = []
@@ -160,9 +160,15 @@ BANNED_RUST = [
     "wintun",
     "kill_on_drop",
 ]
+# تنها استثنا: بلوک کنترل‌پلین لوکال (PUT /configs روی 127.0.0.1) که برای
+# hot-reload لازم است. بقیهٔ فایل نباید هیچ سوکتی داشته باشد.
+CONTROL = re.search(r"// \[control-plane\].*?// \[/control-plane\]", main_rs, re.S)
+shell_only = main_rs.replace(CONTROL.group(0), "") if CONTROL else main_rs
 for token in BANNED_RUST:
-    if token in main_rs:
+    if token in shell_only:
         fail(f"banned token in main.rs: {token} (the shell must not do networking)")
+if CONTROL is None:
+    fail("the control-plane exception is not documented in main.rs")
 
 if "tauri_plugin_updater::Builder::new().build()" not in main_rs:
     fail("the updater plugin is not registered in main.rs")
@@ -260,19 +266,52 @@ if yaml is not None:
                 fail(f"{config_path.name}: proxy mode must disable tun")
     ok(f"parsed {len(configs)} generated configs")
 
-# ── 7. worker lockstep ────────────────────────────────────────
+# ── 7. worker lockstep + topology ─────────────────────────────
+# از v5.4.1 سرور VLESS در JS است (src/entry.mjs + src/vless.js) و راست
+# فقط /health، /sub و /stream را سرو می‌کند. دلیلش در vless.js مستند شده:
+# هر build از wasm که کد WebSocket داشت روی Mainnet با 1101 می‌مرد.
 worker_cargo = read(WORKER / "Cargo.toml")
 worker_toml = read(WORKER / "wrangler.toml")
 worker_rs = read(WORKER / "src" / "lib.rs")
+worker_entry = read(WORKER / "src" / "entry.mjs")
+worker_vless = read(WORKER / "src" / "vless.js")
+
 if f'version      = "{VERSION}"' not in worker_cargo and f'version = "{VERSION}"' not in worker_cargo:
     fail(f"streaming-worker/Cargo.toml must be {VERSION}")
 if f'WORKER_VERSION   = "{VERSION}"' not in worker_toml and f'WORKER_VERSION = "{VERSION}"' not in worker_toml:
     fail(f"wrangler WORKER_VERSION must be {VERSION}")
-if '.get_async("/vless", handle_vless)' not in worker_rs:
-    fail("/vless is not routed in the worker")
-if "Response::from_websocket(client)" not in worker_rs:
-    fail("the worker does not upgrade /vless to a WebSocket")
+if 'main             = "src/entry.mjs"' not in worker_toml and 'main = "src/entry.mjs"' not in worker_toml:
+    fail("wrangler main must be src/entry.mjs (JS entry + rust core)")
+if "createVlessHandler" not in worker_entry:
+    fail("entry.mjs does not route /vless to the VLESS core")
+if "cloudflare:sockets" not in worker_entry:
+    fail("entry.mjs does not import connect() from cloudflare:sockets")
+if "status: 101" not in worker_vless:
+    fail("vless.js does not upgrade /vless to a WebSocket")
+if "WebSocketPair" in worker_rs or "from_websocket" in worker_rs:
+    fail("wasm still contains WebSocket code (this is what caused 1101 on Mainnet)")
 ok("worker + desktop versions are in lockstep")
+
+# ── 8. پیلهٔ فانی: قطع اتصال نباید هسته را بکشد ───────────────
+core_js = read(APP / "src" / "core.js")
+main_js = read(APP / "src" / "main.js")
+main_rs = read(APP / "src-tauri" / "src" / "main.rs")
+
+if "buildDetachedConfig" not in core_js:
+    fail("core.js has no detached (session-less) config — the TUN adapter would die")
+if "external-controller" not in core_js:
+    fail("generated configs lack external-controller (hot reload is impossible)")
+if "hot_reload" not in main_rs:
+    fail("main.rs does not hot-reload the core (reconnect would restart the process)")
+if "scrub_write" not in main_rs:
+    fail("main.rs does not scrub the session file on disconnect")
+if "shutdown_core" not in main_rs:
+    fail("main.rs has no shutdown path that destroys the adapter on exit")
+if "log_line" not in main_rs or "log_line" not in main_js:
+    fail("UI errors are not forwarded into the live log panel")
+if "buildDetachedConfig" not in main_js and "buildDetachedConfig" not in core_js:
+    fail("the UI cannot produce a detached config")
+ok("ephemeral cocoon wired: adapter kept, session wiped, memory cleared on exit")
 
 # ── report ────────────────────────────────────────────────────
 for line in notes:

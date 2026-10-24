@@ -1,6 +1,6 @@
 [package]
 name = "scp-ghost-desktop"
-version = "5.4.0"
+version = "5.4.1"
 description = "SCP-GHOST desktop shell — drives the meow proxy core as a sidecar"
 authors = ["cocoon1990"]
 edition = "2021"

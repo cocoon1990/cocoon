@@ -48,6 +48,10 @@
           <span class="connect-label" id="connect-label">اتصال</span>
         </button>
         <p class="hint" id="hint">برای شروع، لینک اشتراک را وارد کنید.</p>
+        <p class="last-error" id="last-error" hidden></p>
+        <p class="adapter-chip" id="tun-chip" hidden>
+          <span class="dot"></span> آداپتور TUN زنده است — اتصال مجدد فوری
+        </p>
 
         <div class="segmented" id="mode-switch" role="tablist" aria-label="حالت اتصال">
           <span class="thumb" aria-hidden="true"></span>
@@ -118,14 +122,15 @@
             <button class="ghost" id="btn-update" type="button">بررسی به‌روزرسانی</button>
           </div>
 
-          <div class="logs">
-            <div class="logs-head">
-              <span>گزارش هسته</span>
-              <button class="link" id="btn-clear-log" type="button">پاک کردن</button>
-            </div>
-            <pre id="log" dir="ltr"></pre>
-          </div>
         </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>گزارش زنده</h2>
+          <button class="link" id="btn-clear-log" type="button">پاک کردن</button>
+        </div>
+        <pre class="log" id="log" dir="ltr" aria-live="polite"></pre>
       </section>
     </main>
 

@@ -239,5 +239,50 @@ test('compares versions', () => {
   assert.equal(core.compareVersions('5.4.0-beta.1', '5.4.0'), 0);
 });
 
+process.stdout.write('\ncore.js — پیلهٔ فانی (TUN stays alive)\n');
+
+test('detached config keeps the TUN adapter on but has no tunnel', () => {
+  const dead = core.buildDetachedConfig({ mode: 'tun', mixedPort: 7890 });
+  assert.match(dead, /^tun:\n  enable: true/m);
+  assert.match(dead, /^proxies: \[\]$/m);
+  assert.match(dead, /^mode: direct$/m);
+  assert.doesNotMatch(dead, /6f2c1a54/, 'the session uuid must not survive a disconnect');
+  assert.doesNotMatch(dead, /type: vless/, 'no session may remain in the detached config');
+});
+
+test('proxy mode keeps tun disabled in both configs', () => {
+  assert.match(core.buildDetachedConfig({ mode: 'proxy' }), /^tun:\n  enable: false/m);
+  assert.match(core.buildCoreConfig(NODE, { mode: 'proxy' }), /^tun:\n  enable: false/m);
+});
+
+test('both configs expose the local control plane', () => {
+  assert.match(core.buildCoreConfig(NODE, { mode: 'tun' }), /^external-controller: "127\.0\.0\.1:9090"$/m);
+  assert.match(core.buildDetachedConfig({ mode: 'tun' }), /^external-controller: "127\.0\.0\.1:9090"$/m);
+});
+
+test('the control port is configurable and validated', () => {
+  assert.match(core.buildDetachedConfig({ controlPort: 9191 }), /127\.0\.0\.1:9191/);
+  expectCode(() => core.buildDetachedConfig({ controlPort: 70000 }), 'INVALID_PORT');
+});
+
+test('reads the latest release payload from GitHub', () => {
+  const rel = core.readLatestRelease({
+    tag_name: 'desktop-v5.4.1',
+    html_url: 'https://github.com/cocoon1990/cocoon/releases/tag/desktop-v5.4.1',
+    published_at: '2026-10-24T00:00:00Z',
+    assets: [
+      { name: 'SCP-GHOST_5.4.1_x64_en-US.msi', browser_download_url: 'https://x/a.msi' },
+      { name: 'SCP-GHOST_5.4.1_x64-setup.exe', browser_download_url: 'https://x/a.exe' },
+    ],
+  });
+  assert.equal(rel.version, '5.4.1');
+  assert.equal(rel.installer.name, 'SCP-GHOST_5.4.1_x64_en-US.msi');
+  expectCode(() => core.readLatestRelease({}), 'BAD_RELEASE');
+});
+
+test('v5.4.1 is reported newer than the installed 5.4.0', () => {
+  assert.equal(core.compareVersions('5.4.1', '5.4.0'), 1);
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) process.exit(1);
