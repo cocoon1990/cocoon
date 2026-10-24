@@ -1,12 +1,17 @@
 # ══════════════════════════════════════════════════════════════
-#  CI — Rust Workers Build Check
+#  CI — Rust Workers Build Check + production canary
 #
 #  چرا این ورک‌فلو وجود دارد؟
-#  ورک‌فلوی deploy-workers فقط روی push به main اجرا می‌شود. یعنی هیچ
-#  PRی این crateها را کامپایل نمی‌کند و خطاهای Rust تازه بعد از merge
-#  روی main (با یک worker-build چهار دقیقه‌ای) معلوم می‌شوند.
+#  ورک‌فلوی deploy-workers فقط روی push به main اجرا می‌شود؛ یعنی هیچ PR‌ای
+#  این crate‌ها را کامپایل نمی‌کند. این ورک‌فلو سه کار می‌کند:
 #
-#  این ورک‌فلو فقط `cargo check` می‌زند — هیچ deploy‌ای انجام نمی‌دهد.
+#    1. logic  — تست‌های خالص (Python mirror + Node VLESS suite)
+#    2. check  — cargo check روی wasm32
+#    3. preview— اجرای واقعی در workerd + **canary روی رانتایم production**
+#
+#  canary همان artifact را با نام `ghost-streaming-canary` دیپلوی می‌کند و
+#  بلافاصله پاک می‌کند. این همان تستی است که باگ 1101 نسخهٔ 5.4.0 را پیدا
+#  کرد: کار کردن در workerd محلی کافی نیست، باید روی Mainnet هم ۲۰۰ بدهد.
 # ══════════════════════════════════════════════════════════════
 name: "🧪 CI — Rust Workers Build Check"
 
@@ -17,53 +22,53 @@ on:
       - "signaling-worker/**"
       - "streaming-worker/**"
       - ".github/workflows/ci-workers.yml"
+  push:
+    branches: ["arena/ee9be859-cocoon"]
+    paths:
+      - "streaming-worker/**"
+      - ".github/workflows/ci-workers.yml"
 
 concurrency:
-  # توجه: context‌های matrix و steps در concurrency در دسترس نیستند —
-  # فقط github / inputs / vars مجاز است. استفاده از matrix.worker اینجا
-  # کل فایل را نامعتبر می‌کند (GitHub آن را با نام فایل و failure ثبت می‌کند).
+  # context‌های matrix و steps در concurrency در دسترس نیستند — فقط
+  # github / inputs / vars مجاز است.
   group: "ci-workers-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: true
 
 permissions:
-  contents: read   # فقط خواندن — این ورک‌فلو deploy نمی‌کند
+  contents: read
 
 jobs:
   # ── تست منطق خالص ─────────────────────────────────────────────
-  # allowlist مقصد (ضد SSRF) و ساخت URI اشتراک، تابع‌های خالص Rust‌اند
-  # اما cargo test روی wasm32 اجرا نمی‌شود. این job یک پورت خط‌به‌خط
-  # از همان الگوریتم را روی boundary caseها تست می‌کند.
   logic:
-    name: "🐍 Logic mirror test (SSRF allowlist + VLESS URI)"
+    name: "🐍 Logic tests (SSRF allowlist + VLESS codec + pump)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Run mirror test
+      - name: Python mirror (allowlist + subscription URI)
         run: python3 scripts/test_streaming_logic.py
+
+      # سرور VLESS از v5.4.1 جاوااسکریپت است، پس همین‌جا واقعاً اجرا
+      # می‌شود: کدک هدر، SSRF، دست‌دادن و پمپ دوطرفه با mock.
+      - name: VLESS suite (Node)
+        run: node streaming-worker/tests/vless.test.mjs
 
   check:
     name: "🦀 cargo check — ${{ matrix.worker }}"
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     strategy:
       fail-fast: false
       matrix:
         worker: [signaling-worker, streaming-worker]
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      # ── MSRV gate (همان قاعدهٔ deploy-workers) ─────────────
       - name: Enforce crate MSRV
         working-directory: ${{ matrix.worker }}
         run: |
@@ -77,8 +82,7 @@ jobs:
             exit 1
           fi
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "${{ matrix.worker }} -> target"
           key: "ci-${{ matrix.worker }}-${{ hashFiles(format('{0}/Cargo.toml', matrix.worker)) }}"
@@ -87,11 +91,9 @@ jobs:
         working-directory: ${{ matrix.worker }}
         run: |
           set -o pipefail
-          cargo check --release --target wasm32-unknown-unknown 2>&1 \
-            | tee "$RUNNER_TEMP/check.log"
+          cargo check --release --target wasm32-unknown-unknown 2>&1 | tee "$RUNNER_TEMP/check.log"
           echo "✅ ${{ matrix.worker }} compiles"
 
-      # ── در صورت شکست، خطای rustc را به annotation تبدیل کن ──
       - name: Surface compiler errors
         if: failure()
         run: |
@@ -99,7 +101,6 @@ jobs:
           LOG="$RUNNER_TEMP/check.log"
           OUT="$RUNNER_TEMP/surfaced.txt"
           : > "$OUT"
-
           if [ -f "$LOG" ]; then
             echo "size=$(wc -c < "$LOG") bytes" >> "$OUT"
             grep -a -n -E '^(error|warning: unused)' "$LOG" | head -n 20 >> "$OUT" || true
@@ -108,16 +109,93 @@ jobs:
           else
             echo "(no log file was written)" >> "$OUT"
           fi
-
           head -c 6000 "$OUT" > "$RUNNER_TEMP/trim.txt"
           [ -s "$RUNNER_TEMP/trim.txt" ] || echo "no log captured" > "$RUNNER_TEMP/trim.txt"
-
           MSG=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' "$RUNNER_TEMP/trim.txt" \
                 | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
-
           echo "::error title=Rust build failed (${{ matrix.worker }})::$MSG"
 
-          echo "### ❌ ${{ matrix.worker }} failed" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          cat "$RUNNER_TEMP/trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+  # ── workerd + canary روی رانتایم production ────────────────────
+  preview:
+    name: "🔬 workerd + production canary (streaming-worker)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "streaming-worker -> target"
+          key: "preview"
+
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.7 --locked
+
+      - name: Build streaming-worker
+        working-directory: streaming-worker
+        run: worker-build --release
+
+      - name: "workerd (local): /health + /vless + /sub"
+        working-directory: streaming-worker
+        run: |
+          set -uo pipefail
+          npx --yes wrangler@latest dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
+          DEVPID=$!
+          CODE=000
+          for _ in $(seq 1 30); do
+            sleep 2
+            CODE=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/health || true)
+            [ "$CODE" = "200" ] && break
+          done
+          SUB=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/sub || true)
+          VLESS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/vless || true)
+          kill $DEVPID 2>/dev/null || true
+          sleep 1
+
+          echo "health=$CODE sub=$SUB vless=$VLESS"
+          head -c 200 /tmp/health.json || true
+          tail -n 10 /tmp/dev.log || true
+
+          [ "$CODE" = "200" ] || { echo "::error title=workerd /health::got $CODE"; exit 1; }
+          grep -q '"worker":"ghost-streaming"' /tmp/health.json || { echo "::error title=workerd /health::unexpected body"; exit 1; }
+          [ "$VLESS" = "426" ] || [ "$VLESS" = "503" ] || { echo "::error title=workerd /vless::got $VLESS"; exit 1; }
+          [ "$SUB" = "200" ] || [ "$SUB" = "503" ] || { echo "::error title=workerd /sub::got $SUB"; exit 1; }
+
+      # ── canary: همان artifact روی رانتایم production ────────────
+      - name: Canary deploy on the production runtime
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        working-directory: streaming-worker
+        run: |
+          set -uo pipefail
+          sed -e '1s/.*/name = "ghost-streaming-canary"/' wrangler.toml > wrangler.canary.toml
+          trap 'npx --yes wrangler@latest delete --name ghost-streaming-canary --force >/dev/null 2>&1 || true' EXIT
+
+          npx --yes wrangler@latest deploy -c wrangler.canary.toml 2>&1 | tee /tmp/canary.log
+
+          HOST=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' /tmp/canary.log | head -1)
+          [ -n "$HOST" ] || { echo "::error title=canary::could not read the deployed URL"; exit 1; }
+          echo "canary: $HOST"
+
+          CODE=000
+          for attempt in $(seq 1 8); do
+            sleep 10
+            CODE=$(curl -sS -o /tmp/canary.json -w '%{http_code}' --max-time 15 "$HOST/health?cb=$GITHUB_RUN_ID-$attempt" || echo 000)
+            echo "attempt $attempt -> HTTP $CODE"
+            [ "$CODE" = "200" ] && break
+          done
+
+          head -c 300 /tmp/canary.json || true
+          [ "$CODE" = "200" ] || { echo "::error title=canary /health::production runtime returned $CODE"; exit 1; }
+          grep -q '"worker":"ghost-streaming"' /tmp/canary.json || { echo "::error title=canary body::unexpected payload"; exit 1; }
+
+          VLESS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HOST/vless?cb=$GITHUB_RUN_ID" || echo 000)
+          echo "canary /vless -> $VLESS"
+          [ "$VLESS" = "426" ] || [ "$VLESS" = "503" ] || { echo "::error title=canary /vless::got $VLESS"; exit 1; }
+
+          echo "queue_total=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HOST/sub" || echo 000)" || true

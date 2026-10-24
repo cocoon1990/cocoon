@@ -262,53 +262,33 @@ jobs:
             fi
           done
 
-          # ── FAIL-SAFE ──────────────────────────────────────────
-          # دیپلوی در این مرحله انجام شده و موفق بوده است. یک health check
-          # ناموفق (propagation دیرتر از انتظار، DNS، یا شبکه) نباید کل
-          # دیپلوی را قرمز کند؛ فقط به‌صورت warning گزارش می‌شود.
-          echo "::warning title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC). Deployment itself succeeded."
-          echo "⚠️  Not failing the workflow — the deploy step already succeeded."
-          exit 0
+          # ── HARD GATE (v5.4.1+) ────────────────────────────────
+          # تا v5.4.0 این مرحله فقط warning می‌داد و در نتیجه یک worker
+          # مرده (1101) با وضعیت سبز منتشر شد. از این نسخه، اگر worker
+          # بعد از سه تلاش جواب ندهد، دیپلوی قرمز است.
+          echo "::error title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)."
+          exit 1
 
-      - name: "Deploy probe copy (same build, new name)"
-        if: always()
-        continue-on-error: true
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          command: deploy --name ghost-streaming-probe
-          workingDirectory: streaming-worker
-
-      # ── تشخیص 1101: یک کپی از همان build با نام تازه ────────────
-      # Error 1101 روی *همهٔ* مسیرها (حتی /health) یعنی module پیش از
-      # routing می‌میرد. دو فرض رقیب وجود دارد: (۱) کد/وابستگی‌های تازه،
-      # (۲) گیر کردن خود اسکریپت در سمت Cloudflare. اگر همان build با
-      # نام تازه ۲۰۰ بدهد، فرض دوم درست است.
-      - name: "Probe: identical build under a fresh worker name"
-        if: always()
-        continue-on-error: true
-        shell: bash
+      # ── VLESS زنده است؟ (GET بدون Upgrade باید 426 بدهد) ──────
+      - name: "VLESS endpoint live (GET /vless without upgrade → 426)"
         env:
           HEALTH_URL: ${{ secrets.CF_STREAMING_URL }}
         run: |
           set -u
-          if [ -z "${HEALTH_URL:-}" ]; then echo "no CF_STREAMING_URL"; exit 0; fi
-          SUB=$(python3 -c "import os,urllib.parse as u;h=u.urlparse(os.environ['HEALTH_URL']).hostname or '';print(h.split('.',1)[1] if '.' in h else '')")
-          if [ -z "$SUB" ]; then echo "could not derive subdomain"; exit 0; fi
-          PROBE="ghost-streaming-probe.$SUB"
-          echo "probe target: https://$PROBE/health"
-          for attempt in 1 2 3 4 5 6; do
-            CODE=$(curl -sS -o probe_body.txt -w '%{http_code}' --max-time 15 "https://$PROBE/health?cb=$GITHUB_RUN_ID" || echo 000)
-            echo "attempt $attempt -> HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "::warning title=Probe result::fresh name returns 200 — the deployed script is stuck at the edge, not a code bug"
-              cat probe_body.txt; exit 0
-            fi
+          if [ -z "${HEALTH_URL:-}" ]; then
+            echo "::warning::CF_STREAMING_URL is not set. Skipping VLESS check."
+            exit 0
+          fi
+          URL="${HEALTH_URL%/}/vless"
+          CODE=000
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$URL" || echo 000)
+            [ "$CODE" = "426" ] && break
             sleep 10
           done
-          BODY=$(head -c 300 probe_body.txt 2>/dev/null | tr '\n' ' ' | sed 's/%/%25/g')
-          echo "::warning title=Probe result::fresh name also returns $CODE — this is a code/dependency problem, not edge state. body: $BODY"
-          exit 0
+          echo "GET /vless -> $CODE"
+          [ "$CODE" = "426" ] || { echo "::error title=VLESS check failed::GET /vless returned $CODE (expected 426)"; exit 1; }
+          echo "✅ VLESS-over-WebSocket is served (upgrade required)"
 
   # ════════════════════════════════════════════════════════════
   #  Build و Deploy: Signaling Worker
@@ -512,13 +492,33 @@ jobs:
             fi
           done
 
-          # ── FAIL-SAFE ──────────────────────────────────────────
-          # دیپلوی در این مرحله انجام شده و موفق بوده است. یک health check
-          # ناموفق (propagation دیرتر از انتظار، DNS، یا شبکه) نباید کل
-          # دیپلوی را قرمز کند؛ فقط به‌صورت warning گزارش می‌شود.
-          echo "::warning title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC). Deployment itself succeeded."
-          echo "⚠️  Not failing the workflow — the deploy step already succeeded."
-          exit 0
+          # ── HARD GATE (v5.4.1+) ────────────────────────────────
+          # تا v5.4.0 این مرحله فقط warning می‌داد و در نتیجه یک worker
+          # مرده (1101) با وضعیت سبز منتشر شد. از این نسخه، اگر worker
+          # بعد از سه تلاش جواب ندهد، دیپلوی قرمز است.
+          echo "::error title=Health check failed::$URL did not return HTTP 200 after $MAX_ATTEMPTS attempts (last: HTTP $STATUS, curl rc $CURL_RC)."
+          exit 1
+
+      # ── VLESS زنده است؟ (GET بدون Upgrade باید 426 بدهد) ──────
+      - name: "VLESS endpoint live (GET /vless without upgrade → 426)"
+        env:
+          HEALTH_URL: ${{ secrets.CF_STREAMING_URL }}
+        run: |
+          set -u
+          if [ -z "${HEALTH_URL:-}" ]; then
+            echo "::warning::CF_STREAMING_URL is not set. Skipping VLESS check."
+            exit 0
+          fi
+          URL="${HEALTH_URL%/}/vless"
+          CODE=000
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$URL" || echo 000)
+            [ "$CODE" = "426" ] && break
+            sleep 10
+          done
+          echo "GET /vless -> $CODE"
+          [ "$CODE" = "426" ] || { echo "::error title=VLESS check failed::GET /vless returned $CODE (expected 426)"; exit 1; }
+          echo "✅ VLESS-over-WebSocket is served (upgrade required)"
 
   # ════════════════════════════════════════════════════════════
   #  Summary Job

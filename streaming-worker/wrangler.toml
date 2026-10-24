@@ -1,5 +1,5 @@
 name             = "ghost-streaming-worker"
-main             = "build/worker/shim.mjs"
+main             = "src/entry.mjs"
 compatibility_date = "2025-10-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -42,7 +42,7 @@ id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 #   uuidgen
 
 [vars]
-WORKER_VERSION   = "5.4.0"
+WORKER_VERSION   = "5.4.1"
 CONFIG_KV_KEY    = "routing_config"
 RATE_LIMIT_RPM   = "500"
 RATE_WINDOW_MS   = "60000"
