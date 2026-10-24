@@ -21,9 +21,9 @@
 //
 //  import() پویا روی ServiceWorkerGlobalScope طبق مشخصات مسدود است؛
 //  حتی در یک Module Service Worker هم باید از import ایستا استفاده کرد.
-//  ?v=5.2.3 همچنین کشِ نسخه‌های قبلی را دور می‌زند.
+//  ?v=5.2.4 همچنین کشِ نسخه‌های قبلی را دور می‌زند.
 // ──────────────────────────────────────────────────────────────
-import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.2.3";
+import initWasm, * as ghostWasm from "./wasm/ghost_wasm.js?v=5.2.4";
 
 // ──────────────────────────────────────────────────────────────
 //  Endpoint URLs — توسط deploy-pages.yml در زمان build inject می‌شوند
@@ -34,9 +34,9 @@ const SIGNALING_WORKER_URL = "__CF_SIGNALING_URL__";
 // ──────────────────────────────────────────────────────────────
 //  Constants
 // ──────────────────────────────────────────────────────────────
-const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.2.3"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
+const WASM_MODULE_PATH = "./wasm/ghost_wasm.js?v=5.2.4"; // فقط برای لاگ؛ import بالا باید همین مقدار باشد
 const CONFIG_CACHE_KEY  = "ghost-routing-config-v5";
-const SW_VERSION        = "5.2.3";   // 5.2.3: نگاشت صریح backend (رفع unknown-backend)
+const SW_VERSION        = "5.2.4";   // 5.2.4: cache-bust باینری wasm
 
 // ──────────────────────────────────────────────────────────────
 //  State — module-level (در Worker thread زندگی می‌کند)
@@ -241,7 +241,13 @@ async function loadWasmModule() {
       }
 
       // ماژول glue قبلاً بهصورت ایستا import شده؛ اینجا فقط باینری را لود میکند.
-      await initWasm();
+      // ⚠️ باینری .wasm صریح و نسخه‌دار لود می‌شود.
+      // glue به‌طور پیش‌فرض new URL('ghost_wasm_bg.wasm', import.meta.url)
+      // را بدون هیچ query می‌گیرد؛ یعنی حتی وقتی glue با ?v=… تازه
+      // می‌شد، باینری از کش قدیمی می‌آمد و نگاشت قدیمی backend اجرا می‌شد.
+      await initWasm({
+        module_or_path: new URL(`./wasm/ghost_wasm_bg.wasm?v=${SW_VERSION}`, import.meta.url),
+      });
       wasmModule = ghostWasm;
     }
 
