@@ -155,35 +155,40 @@ jobs:
         run: |
           set -uo pipefail
           cd streaming-worker
-          npx --yes wrangler@3 dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
+
+          echo "npx wrangler@latest --version"; npx --yes wrangler@latest --version || true
+
+          npx --yes wrangler@latest dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
           DEVPID=$!
-          CODE=000
-          for i in $(seq 1 30); do
+          CODES=""
+          for i in $(seq 1 25); do
             sleep 2
             CODE=$(curl -sS -o /tmp/body.txt -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/health || true)
+            CODES="$CODES $CODE"
             echo "attempt $i -> $CODE"
             [ "$CODE" = "200" ] && break
           done
           kill $DEVPID 2>/dev/null || true
           sleep 1
 
-          echo "=========== RESPONSE BODY ==========="; cat /tmp/body.txt 2>/dev/null | head -c 800; echo
-          echo "=========== WORKERD LOG (tail) ==========="; tail -c 6000 /tmp/dev.log 2>/dev/null
+          {
+            echo "codes:$CODES"
+            echo "--- body ---"; head -c 600 /tmp/body.txt 2>/dev/null || true
+            echo; echo "--- dev.log (last 20) ---"; tail -n 20 /tmp/dev.log 2>/dev/null || true
+          } > /tmp/report.txt
 
-          # استثنا را به annotation تبدیل کن تا از API خواندنی باشد
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import re, pathlib
-          log = pathlib.Path('/tmp/dev.log').read_text(errors='replace')
-          keep = [l for l in log.splitlines() if re.search(r'(Error|error|Exception|panic|unreachable|TypeError|RuntimeError|1101)', l)]
-          print('\n'.join(keep[-25:]) or '(no error lines)')
-          PY
           python3 - <<'PY'
-          import pathlib, re
-          log = pathlib.Path('/tmp/dev.log').read_text(errors='replace')
-          lines = [l.strip() for l in log.splitlines() if re.search(r'(Error|error|Exception|panic|unreachable|TypeError|RuntimeError)', l)]
-          for line in lines[-8:]:
-              line = line.replace('%', '%25').replace('\r', ' ')[:400]
-              print(f"::error title=workerd::{line}")
-          print("::error title=workerd probe::note-console-emitted")
+          import pathlib
+          report = pathlib.Path('/tmp/report.txt').read_text(errors='replace')
+          chunks = []
+          cur = ''
+          for line in report.splitlines():
+              if len(cur) + len(line) > 900:
+                  chunks.append(cur); cur = ''
+              cur += line + '%0A'
+          if cur: chunks.append(cur)
+          for i, chunk in enumerate(chunks[:8]):
+              chunk = chunk.replace('%', '%25').replace('%250A', '%0A')
+              print(f"::error title=workerd-run-{i}::{chunk}")
           PY
           exit 0
