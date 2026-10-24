@@ -121,3 +121,69 @@ jobs:
           echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           cat "$RUNNER_TEMP/trim.txt" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo '```' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  # ── اجرای واقعی در workerd (بدون deploy) ───────────────────────
+  # اگر worker در Mainnet با 1101 می‌میرد، اینجا استثنای واقعی چاپ
+  # می‌شود. عمداً فقط برای streaming-worker و فقط روی PR.
+  preview:
+    name: "🔬 Local workerd run (streaming-worker)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "streaming-worker -> target"
+          key: "preview"
+
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.7 --locked
+
+      - name: Build streaming-worker
+        working-directory: streaming-worker
+        run: worker-build --release
+
+      - name: Run it in workerd and capture the exception
+        run: |
+          set -uo pipefail
+          cd streaming-worker
+          npx --yes wrangler@3 dev --local --port 8787 --ip 127.0.0.1 > /tmp/dev.log 2>&1 &
+          DEVPID=$!
+          CODE=000
+          for i in $(seq 1 30); do
+            sleep 2
+            CODE=$(curl -sS -o /tmp/body.txt -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/health || true)
+            echo "attempt $i -> $CODE"
+            [ "$CODE" = "200" ] && break
+          done
+          kill $DEVPID 2>/dev/null || true
+          sleep 1
+
+          echo "=========== RESPONSE BODY ==========="; cat /tmp/body.txt 2>/dev/null | head -c 800; echo
+          echo "=========== WORKERD LOG (tail) ==========="; tail -c 6000 /tmp/dev.log 2>/dev/null
+
+          # استثنا را به annotation تبدیل کن تا از API خواندنی باشد
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import re, pathlib
+          log = pathlib.Path('/tmp/dev.log').read_text(errors='replace')
+          keep = [l for l in log.splitlines() if re.search(r'(Error|error|Exception|panic|unreachable|TypeError|RuntimeError|1101)', l)]
+          print('\n'.join(keep[-25:]) or '(no error lines)')
+          PY
+          python3 - <<'PY'
+          import pathlib, re
+          log = pathlib.Path('/tmp/dev.log').read_text(errors='replace')
+          lines = [l.strip() for l in log.splitlines() if re.search(r'(Error|error|Exception|panic|unreachable|TypeError|RuntimeError)', l)]
+          for line in lines[-8:]:
+              line = line.replace('%', '%25').replace('\r', ' ')[:400]
+              print(f"::error title=workerd::{line}")
+          print("::error title=workerd probe::note-console-emitted")
+          PY
+          exit 0
