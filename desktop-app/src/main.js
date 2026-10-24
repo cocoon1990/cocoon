@@ -1,80 +1,60 @@
-/* SCP-GHOST desktop — منطق رابط کاربری
+/* SCP-GHOST desktop — رابط کاربری و کنترل‌کنندهٔ نازک
  *
- * هیچ وابستگی خارجی ندارد: فقط پل `window.__TAURI__.core.invoke`.
- * تمام کارهای رمزنگاری و شبکه در Rust انجام می‌شود؛ این فایل فقط نمایش است.
+ * جریان کار:
+ *   ۱) متن اشتراک را از بک‌اند می‌گیرد (Rust، بدون درگیری CORS)
+ *   ۲) URI را به کانفیگ هسته تبدیل می‌کند (core-config.js — تست‌شده)
+ *   ۳) کانفیگ را به بک‌اند می‌دهد تا بنویسد و sidecar را اجرا کند
+ *
+ * هیچ منطق شبکه‌ای اینجا نیست؛ نه سوکت، نه TUN، نه رمزنگاری.
  */
 
 'use strict';
 
 const bridge = window.__TAURI__ && window.__TAURI__.core ? window.__TAURI__.core : null;
+const cfg = window.SCPGhostConfig;
 
 const el = {
-  version: document.getElementById('version'),
   dot: document.getElementById('dot'),
   label: document.getElementById('status-label'),
   hint: document.getElementById('status-hint'),
   connect: document.getElementById('btn-connect'),
   disconnect: document.getElementById('btn-disconnect'),
+  badge: document.getElementById('mode-badge'),
+  subUrl: document.getElementById('sub-url'),
+  fetch: document.getElementById('btn-fetch'),
+  subState: document.getElementById('sub-state'),
+  nodeInfo: document.getElementById('node-info'),
+  nodeServer: document.getElementById('node-server'),
+  nodeNetwork: document.getElementById('node-network'),
+  nodeSecurity: document.getElementById('node-security'),
+  nodeName: document.getElementById('node-name'),
+  modeTun: document.getElementById('mode-tun'),
+  modeProxy: document.getElementById('mode-proxy'),
+  modeNote: document.getElementById('mode-note'),
   proxy: document.getElementById('proxy'),
   copy: document.getElementById('btn-copy'),
-  configVersion: document.getElementById('config-version'),
-  seq: document.getElementById('seq'),
-  endpoint: document.getElementById('endpoint'),
-  testTarget: document.getElementById('test-target'),
-  test: document.getElementById('btn-test'),
-  testResult: document.getElementById('test-result'),
-  log: document.getElementById('log'),
+  pid: document.getElementById('pid'),
+  configPath: document.getElementById('config-path'),
+  log: document.getElementById('core-log'),
   warning: document.getElementById('bridge-warning'),
 };
 
-const STATE_TEXT = {
-  off: ['قطع', 'برای شروع، اتصال را برقرار کنید.'],
-  busy: ['در حال اتصال…', 'تبادل کلید X25519 با سرور signaling'],
-  on: ['متصل و امن', 'کلیدها فقط در حافظهٔ همین فرایند نگهداری می‌شوند.'],
-  error: ['خطا', 'جزئیات در بخش رویدادها آمده است.'],
+const MODE_NOTE = {
+  tun:
+    'TUN همهٔ ترافیک ویندوز را از هسته عبور می‌دهد و به دسترسی مدیر نیاز دارد ' +
+    '(برنامه با UAC بالا می‌آید).',
+  proxy:
+    'فقط برنامه‌هایی که از پراکسی سیستم استفاده می‌کنند از این مسیر عبور می‌کنند. ' +
+    'بدون نیاز به دسترسی مدیر.',
 };
 
-let pollTimer = null;
+let mode = 'tun';
 let busy = false;
+let pollTimer = null;
+let lastLog = '';
+let lastPayload = '';
 
-/* ── ابزارک‌ها ─────────────────────────────────────────────── */
-
-function stamp() {
-  const d = new Date();
-  return d.toTimeString().slice(0, 8);
-}
-
-function log(message, level = 'info') {
-  const li = document.createElement('li');
-  li.dataset.level = level;
-
-  const time = document.createElement('time');
-  time.textContent = stamp();
-
-  const text = document.createElement('span');
-  text.textContent = message;
-
-  li.append(time, text);
-  el.log.prepend(li);
-
-  while (el.log.children.length > 40) {
-    el.log.lastElementChild.remove();
-  }
-}
-
-function setState(state, hint) {
-  el.dot.dataset.state = state;
-  const [label, defaultHint] = STATE_TEXT[state] || STATE_TEXT.off;
-  el.label.textContent = label;
-  el.hint.textContent = hint || defaultHint;
-}
-
-function setBusy(value) {
-  busy = value;
-  el.connect.disabled = value || el.disconnect.dataset.connected === 'true';
-  el.disconnect.disabled = value || el.disconnect.dataset.connected !== 'true';
-  el.test.disabled = value || el.disconnect.dataset.connected !== 'true';
-}
+/* ── ابزار ─────────────────────────────────────────────────── */
 
 function errorMessage(err) {
   if (typeof err === 'string') return err;
@@ -83,176 +63,210 @@ function errorMessage(err) {
 }
 
 async function invoke(command, args) {
-  if (!bridge) throw new Error('Tauri bridge unavailable');
+  if (!bridge) throw new Error('پل Tauri در دسترس نیست.');
   return bridge.invoke(command, args);
 }
 
-/* ── رندر وضعیت ────────────────────────────────────────────── */
+function setState(state, hint) {
+  el.dot.dataset.state = state;
+  const labels = {
+    off: 'قطع',
+    busy: 'در حال کار…',
+    on: 'متصل',
+    error: 'خطا',
+  };
+  el.label.textContent = labels[state] || labels.off;
+  if (hint !== undefined) el.hint.textContent = hint;
+}
 
-function render(status) {
-  el.version.textContent = `v${status.version || '—'}`;
-  el.endpoint.textContent = status.streamingUrl || '—';
-  el.seq.textContent = String(status.seq ?? 0);
-  el.configVersion.textContent = status.configVersion || '—';
+function setMode(next) {
+  mode = next === 'proxy' ? 'proxy' : 'tun';
+  el.badge.textContent = mode === 'tun' ? 'TUN' : 'PROXY';
+  el.badge.dataset.mode = mode;
+  el.modeTun.classList.toggle('active', mode === 'tun');
+  el.modeProxy.classList.toggle('active', mode === 'proxy');
+  el.modeNote.textContent = MODE_NOTE[mode];
+}
 
-  const connected = Boolean(status.connected);
+function updateButtons(running) {
+  el.connect.disabled = busy || running;
+  el.disconnect.disabled = busy || !running;
+  el.fetch.disabled = busy;
+}
 
-  el.disconnect.dataset.connected = connected ? 'true' : 'false';
-  el.connect.disabled = busy || connected;
-  el.disconnect.disabled = busy || !connected;
-  el.test.disabled = busy || !connected;
+function renderLog(log) {
+  const text = (log || []).join('\n');
+  if (text === lastLog) return;
+  lastLog = text;
+  el.log.textContent = text || '(بدون خروجی)';
+  el.log.scrollTop = el.log.scrollHeight;
+}
 
-  if (!busy) setState(connected ? 'on' : 'off');
+function renderStatus(status) {
+  updateButtons(status.running);
+  el.pid.textContent = status.pid ? String(status.pid) : '—';
+  el.proxy.textContent = status.proxyUrl || '—';
+  el.configPath.textContent = status.configPath || '—';
+  el.configPath.title = status.configPath || '';
+  renderLog(status.log);
 
-  if (status.proxyPort) {
-    el.proxy.textContent = `127.0.0.1:${status.proxyPort}`;
-    el.copy.disabled = false;
+  if (status.running) {
+    setState('on', 'هستهٔ پراکسی در حال اجراست.');
+    if (!pollTimer) pollTimer = setInterval(poll, 1200);
   } else {
-    el.proxy.textContent = '—';
-    el.copy.disabled = true;
-  }
-
-  if (connected && !pollTimer) {
-    pollTimer = setInterval(refresh, 2000);
-  } else if (!connected && pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (!busy) setState('off', 'برای شروع، دکمهٔ «اتصال» را بزنید.');
   }
 }
 
-function renderError(message) {
-  setState('error', message);
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
-  el.disconnect.dataset.connected = 'false';
-  el.connect.disabled = false;
-  el.disconnect.disabled = true;
-  el.test.disabled = true;
-  el.proxy.textContent = '—';
-}
-
-/* ── عملیات ────────────────────────────────────────────────── */
-
-async function refresh() {
+async function poll() {
   try {
-    render(await invoke('status'));
+    const status = await invoke('core_status');
+    const wasRunning = el.disconnect.disabled === false;
+    renderStatus(status);
+    if (!status.running && !busy && wasRunning) {
+      setState('error', 'هسته متوقف شد؛ لاگ را بررسی کنید.');
+    }
   } catch (err) {
-    /* polling نباید UI را خراب کند */
     console.warn('status poll failed', err);
   }
 }
 
+/* ── اشتراک ────────────────────────────────────────────────── */
+
+async function loadSubscription(showState) {
+  const url = el.subUrl.value.trim();
+  if (!url) throw new Error('آدرس اشتراک خالی است.');
+
+  if (showState) {
+    el.subState.textContent = 'در حال دریافت…';
+    el.subState.className = 'muted';
+  }
+
+  const payload = await invoke('fetch_subscription', { url });
+  const node = cfg.parseVlessUri(cfg.extractVlessUri(payload.body));
+
+  el.nodeInfo.hidden = false;
+  el.nodeServer.textContent = `${node.server}:${node.port}`;
+  el.nodeNetwork.textContent = node.network;
+  el.nodeSecurity.textContent = node['reality-opts']
+    ? 'reality'
+    : node.tls
+      ? `tls (${node['client-fingerprint']})`
+      : 'none';
+  el.nodeName.textContent = node.name;
+
+  if (showState) {
+    el.subState.textContent = `دریافت شد (${payload.bytes} بایت)`;
+    el.subState.className = 'muted ok';
+  }
+
+  lastPayload = payload.body;
+  return node;
+}
+
+/* ── عملیات ────────────────────────────────────────────────── */
+
 async function connect() {
   if (busy) return;
-  setState('busy');
-  setBusy(true);
-  log('شروع تبادل کلید…');
+  busy = true;
+  updateButtons(true);
+  setState('busy', 'دریافت اشتراک و ساخت کانفیگ…');
 
   try {
-    const status = await invoke('connect');
-    setBusy(false);
-    render(status);
-    log('اتصال برقرار شد؛ کلید امضا در حافظه فعال است.', 'ok');
-    if (status.proxyPort) {
-      log(`پراکسی محلی روی 127.0.0.1:${status.proxyPort} گوش می‌دهد.`);
+    const node = await loadSubscription(true);
+    setState('busy', 'نوشتن کانفیگ و اجرای هسته…');
+
+    const config = cfg.buildCoreConfig({ node, mode });
+    const status = await invoke('start_core', { config, mode });
+
+    busy = false;
+    renderStatus(status);
+
+    if (!status.running) {
+      setState('error', 'هسته بالا نیامد؛ لاگ را بررسی کنید.');
     } else {
-      log('پراکسی محلی فعال نشد (پورت اشغال بود) — تست تونل همچنان کار می‌کند.', 'error');
+      setState('on', `هسته با حالت ${mode === 'tun' ? 'TUN' : 'پراکسی محلی'} در حال اجراست.`);
     }
   } catch (err) {
+    busy = false;
     const message = errorMessage(err);
-    setBusy(false);
-    renderError(message);
-    log(`اتصال ناموفق: ${message}`, 'error');
+    setState('error', message);
+    updateButtons(false);
+    try {
+      await invoke('stop_core');
+    } catch {
+      /* هسته‌ای نبوده */
+    }
   }
 }
 
 async function disconnect() {
   if (busy) return;
-  setBusy(true);
-  log('قطع اتصال…');
+  busy = true;
+  updateButtons(true);
 
   try {
-    const status = await invoke('disconnect');
-    setBusy(false);
-    render(status);
-    log('اتصال قطع شد و کلید امضا پاک‌سازی شد.', 'ok');
-    el.testResult.hidden = true;
+    const status = await invoke('stop_core');
+    busy = false;
+    renderStatus(status);
+    setState('off', 'اتصال قطع شد.');
   } catch (err) {
+    busy = false;
     const message = errorMessage(err);
-    setBusy(false);
-    renderError(message);
-    log(`قطع اتصال ناموفق: ${message}`, 'error');
+    setState('error', message);
+    updateButtons(false);
   }
 }
 
-async function runTest() {
-  const target = el.testTarget.value.trim();
-  if (!target) {
-    log('آدرس تست خالی است.', 'error');
-    return;
-  }
-
-  el.test.disabled = true;
-  el.testResult.hidden = false;
-  el.testResult.className = 'result';
-  el.testResult.textContent = 'در حال ارسال…';
-
+async function inspectSubscription() {
   try {
-    const result = await invoke('tunnel_test', { target });
-    const header = `HTTP ${result.status}${result.ghostPath ? ` · ${result.ghostPath}` : ''}`;
-    el.testResult.textContent = `${header}\n${result.body || '(بدون بدنه)'}`;
-    el.testResult.className = `result ${result.ok ? 'ok' : 'fail'}`;
-    log(
-      result.ok
-        ? `تست تونل موفق بود (HTTP ${result.status}).`
-        : `تست تونل شکست خورد (HTTP ${result.status}).`,
-      result.ok ? 'ok' : 'error'
-    );
+    await loadSubscription(true);
   } catch (err) {
     const message = errorMessage(err);
-    el.testResult.textContent = message;
-    el.testResult.className = 'result fail';
-    log(`تست تونل ناموفق: ${message}`, 'error');
-  } finally {
-    setBusy(false);
-    el.test.disabled = el.disconnect.dataset.connected !== 'true';
+    el.subState.textContent = message;
+    el.subState.className = 'muted fail';
   }
 }
 
 async function copyProxy() {
   const value = el.proxy.textContent.trim();
   if (!value || value === '—') return;
-
   try {
     await navigator.clipboard.writeText(value);
-    log(`آدرس پراکسی کپی شد: ${value}`, 'ok');
   } catch {
-    log('کپی خودکار ممکن نشد؛ آدرس را دستی انتخاب کنید.', 'error');
+    /* بی‌اهمیت */
   }
 }
 
 /* ── راه‌اندازی ────────────────────────────────────────────── */
 
 function boot() {
+  setMode('tun');
+
   el.connect.addEventListener('click', connect);
   el.disconnect.addEventListener('click', disconnect);
-  el.test.addEventListener('click', runTest);
+  el.fetch.addEventListener('click', inspectSubscription);
   el.copy.addEventListener('click', copyProxy);
-  el.testTarget.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !el.test.disabled) runTest();
+  el.modeTun.addEventListener('click', () => setMode('tun'));
+  el.modeProxy.addEventListener('click', () => setMode('proxy'));
+  window.addEventListener('beforeunload', () => {
+    if (pollTimer) clearInterval(pollTimer);
   });
 
-  if (!bridge) {
+  if (!bridge || !cfg) {
     el.warning.hidden = false;
     setState('error', 'این صفحه در مرورگر معمولی باز شده است.');
+    updateButtons(false);
     el.connect.disabled = true;
+    el.fetch.disabled = true;
     return;
   }
 
-  log('برنامه آماده است.');
-  refresh();
+  poll();
 }
 
 boot();

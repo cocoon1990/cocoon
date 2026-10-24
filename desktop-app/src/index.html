@@ -10,14 +10,12 @@
   <main class="shell">
     <!-- ── هدر ─────────────────────────────────────────────── -->
     <header class="head">
-      <div class="mark" aria-hidden="true">
-        <span class="mark-dot"></span>
-      </div>
+      <div class="mark" aria-hidden="true"><span class="mark-dot"></span></div>
       <div class="head-text">
         <h1>SCP-GHOST</h1>
-        <p class="sub">کلاینت دسکتاپ &mdash; تونل امضاشده</p>
+        <p class="sub">کنترل‌کنندهٔ هستهٔ <span dir="ltr">meow</span> &mdash; mihomo-compatible</p>
       </div>
-      <span class="ver" id="version" title="نسخهٔ برنامه">v&mdash;</span>
+      <span class="badge" id="mode-badge" title="حالت فعال">TUN</span>
     </header>
 
     <!-- ── وضعیت ───────────────────────────────────────────── -->
@@ -26,69 +24,79 @@
         <span class="dot" id="dot" data-state="off"></span>
         <div class="status-text">
           <strong id="status-label">قطع</strong>
-          <small id="status-hint">برای شروع، اتصال را برقرار کنید.</small>
+          <small id="status-hint">برای شروع، دکمهٔ «اتصال» را بزنید.</small>
         </div>
       </div>
-
       <div class="actions">
         <button id="btn-connect" class="btn primary" type="button">اتصال</button>
         <button id="btn-disconnect" class="btn ghost" type="button" disabled>قطع</button>
       </div>
     </section>
 
-    <!-- ── جزئیات ──────────────────────────────────────────── -->
+    <!-- ── اشتراک ──────────────────────────────────────────── -->
     <section class="card">
-      <h2>جزئیات اتصال</h2>
-      <dl class="kv">
-        <div class="kv-row">
-          <dt>پراکسی محلی</dt>
-          <dd>
-            <code id="proxy" dir="ltr">&mdash;</code>
-            <button id="btn-copy" class="mini" type="button" title="کپی آدرس">کپی</button>
-          </dd>
-        </div>
-        <div class="kv-row">
-          <dt>نسخهٔ کانفیگ</dt>
-          <dd><code id="config-version" dir="ltr">&mdash;</code></dd>
-        </div>
-        <div class="kv-row">
-          <dt>شمارندهٔ امضا</dt>
-          <dd><code id="seq" dir="ltr">0</code></dd>
-        </div>
-        <div class="kv-row">
-          <dt>بک‌اند</dt>
-          <dd><code id="endpoint" dir="ltr" class="trunc">&mdash;</code></dd>
-        </div>
+      <h2>اشتراک VLESS</h2>
+      <input id="sub-url" type="url" dir="ltr" spellcheck="false"
+             value="https://ghost-streaming-worker.cocoon-de9.workers.dev/sub"
+             placeholder="https://…/sub?token=…" />
+      <div class="row">
+        <button id="btn-fetch" class="btn" type="button">دریافت و بررسی</button>
+        <span id="sub-state" class="muted">وارد نشده</span>
+      </div>
+      <dl class="kv" id="node-info" hidden>
+        <div class="kv-row"><dt>سرور</dt><dd><code id="node-server" dir="ltr"></code></dd></div>
+        <div class="kv-row"><dt>حمل‌ونقل</dt><dd><code id="node-network" dir="ltr"></code></dd></div>
+        <div class="kv-row"><dt>امنیت</dt><dd><code id="node-security" dir="ltr"></code></dd></div>
+        <div class="kv-row"><dt>نام نود</dt><dd><code id="node-name" dir="ltr"></code></dd></div>
       </dl>
-      <p class="note">
-        دسترسی فقط برای دامنه‌های مجاز تونل و فقط روی <code dir="ltr">GET</code> است؛
-        این برنامه forward-proxy عمومی نیست.
+    </section>
+
+    <!-- ── حالت ────────────────────────────────────────────── -->
+    <section class="card">
+      <h2>حالت اتصال</h2>
+      <div class="segmented" role="group" aria-label="حالت اتصال">
+        <button id="mode-tun" class="seg active" type="button" data-mode="tun">
+          تونل کامل (TUN)
+        </button>
+        <button id="mode-proxy" class="seg" type="button" data-mode="proxy">
+          پراکسی محلی
+        </button>
+      </div>
+      <p class="note" id="mode-note">
+        TUN همهٔ ترافیک ویندوز را از هسته عبور می‌دهد و به دسترسی مدیر نیاز دارد
+        (برنامه با UAC بالا می‌آید).
       </p>
     </section>
 
-    <!-- ── تست تونل ────────────────────────────────────────── -->
+    <!-- ── جزئیات ──────────────────────────────────────────── -->
     <section class="card">
-      <h2>تست تونل</h2>
-      <div class="test-row">
-        <input id="test-target" type="url" dir="ltr"
-               value="https://www.youtube.com/robots.txt"
-               placeholder="https://www.youtube.com/robots.txt" spellcheck="false" />
-        <button id="btn-test" class="btn" type="button" disabled>اجرا</button>
-      </div>
-      <pre id="test-result" class="result" dir="ltr" hidden></pre>
+      <h2>جزئیات اجرا</h2>
+      <dl class="kv">
+        <div class="kv-row"><dt>پراکسی محلی</dt>
+          <dd><code id="proxy" dir="ltr">&mdash;</code>
+            <button id="btn-copy" class="mini" type="button">کپی</button></dd></div>
+        <div class="kv-row"><dt>فرایند هسته</dt><dd><code id="pid" dir="ltr">&mdash;</code></dd></div>
+        <div class="kv-row"><dt>کانفیگ</dt><dd><code id="config-path" dir="ltr" class="trunc">&mdash;</code></dd></div>
+      </dl>
     </section>
 
-    <!-- ── لاگ ─────────────────────────────────────────────── -->
+    <!-- ── لاگ هسته ────────────────────────────────────────── -->
     <section class="card">
-      <h2>رویدادها</h2>
-      <ul id="log" class="log" aria-live="polite"></ul>
+      <h2>لاگ هسته</h2>
+      <pre id="core-log" class="log" dir="ltr">(بدون خروجی)</pre>
     </section>
 
     <p id="bridge-warning" class="banner" hidden>
       پل Tauri در دسترس نیست &mdash; این صفحه فقط داخل برنامهٔ دسکتاپ کار می‌کند.
     </p>
+
+    <p class="foot">
+      هستهٔ پراکسی: <span dir="ltr">meow (mihomo-compatible, Rust)</span> &mdash;
+      این برنامه هیچ کد TUN یا سوکتی ندارد؛ فقط هسته را اجرا و متوقف می‌کند.
+    </p>
   </main>
 
+  <script src="core-config.js"></script>
   <script src="main.js"></script>
 </body>
 </html>

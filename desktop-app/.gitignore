@@ -2,6 +2,13 @@
 src-tauri/target/
 src-tauri/gen/schemas/
 
+# هستهٔ پراکسی در زمان build دانلود می‌شود (workflow یا README)
+src-tauri/binaries/
+
+# ابزارهای موقت تست
+.tools/
+tools/out/
+
 # فایل‌های موقت ویندوز
 *.pdb
 *.exp

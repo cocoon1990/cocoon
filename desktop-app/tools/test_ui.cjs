@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /* آزمون رابط کاربری بدون باز کردن پنجرهٔ واقعی.
  *
- * `index.html` + `main.js` داخل یک DOM مجازی (jsdom) بالا می‌آیند و پل
- * Tauri با یک ماک جایگزین می‌شود؛ سپس مسیرهای واقعی کاربر اجرا می‌شوند:
- * اتصال، قطع، تست تونل و حالت «بدون پل».
+ * `index.html` + `core-config.js` + `main.js` داخل یک DOM مجازی (jsdom)
+ * بالا می‌آیند و پل Tauri با یک ماک جایگزین می‌شود؛ سپس مسیرهای واقعی
+ * کاربر اجرا می‌شوند: دریافت اشتراک، اتصال، قطع، خطای هسته، حالت بدون پل.
  *
  * پیش‌نیاز (فقط برای این تست):  npm install jsdom
  * اجرا:                          NODE_PATH=<dir با node_modules> node desktop-app/tools/test_ui.cjs
@@ -24,7 +24,13 @@ try {
 
 const ROOT = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'src', 'index.html'), 'utf8');
-const script = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+const coreConfig = fs.readFileSync(path.join(ROOT, 'src', 'core-config.js'), 'utf8');
+const mainJs = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+
+const WS_URI =
+  'vless://11111111-2222-3333-4444-555555555555@edge.example.com:443' +
+  '?encryption=none&security=tls&sni=edge.example.com&fp=chrome&type=ws' +
+  '&host=edge.example.com&path=%2Fvless#GHOST';
 
 let checks = 0;
 const failures = [];
@@ -39,35 +45,20 @@ function check(condition, label) {
   }
 }
 
-function tick() {
-  return new Promise((resolve) => setTimeout(resolve, 5));
-}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 6));
 
-function makeStatus(overrides) {
-  return Object.assign(
-    {
-      connected: false,
-      proxyPort: null,
-      configVersion: null,
-      seq: 0,
-      version: '5.2.6',
-      streamingUrl: 'https://ghost-streaming-worker.cocoon-de9.workers.dev',
-    },
-    overrides
-  );
-}
-
-function boot(withBridge) {
+function boot({ withBridge = true, subscription = WS_URI, running = false } = {}) {
   const dom = new JSDOM(html, { runScripts: 'outside-only', url: 'http://localhost/' });
   const { window } = dom;
   const calls = [];
 
   const backend = {
-    status: makeStatus(),
-    connectResult: makeStatus({ connected: true, proxyPort: 8899, configVersion: '5.1.1' }),
-    disconnectResult: makeStatus(),
-    testResult: { status: 200, ok: true, ghostPath: 'streaming', body: 'User-agent: *\nAllow: /' },
-    failConnect: null,
+    subscription,
+    running,
+    startedConfig: null,
+    startError: null,
+    fetchError: null,
+    log: ['[meow] core ready'],
   };
 
   if (withBridge) {
@@ -75,130 +66,189 @@ function boot(withBridge) {
       core: {
         invoke: async (command, args) => {
           calls.push({ command, args });
-          if (command === 'status') return backend.status;
-          if (command === 'connect') {
-            if (backend.failConnect) throw backend.failConnect;
-            backend.status = backend.connectResult;
-            return backend.connectResult;
+          if (command === 'fetch_subscription') {
+            if (backend.fetchError) throw backend.fetchError;
+            return {
+              body: backend.subscription,
+              bytes: backend.subscription.length,
+              status: 200,
+            };
           }
-          if (command === 'disconnect') {
-            backend.status = backend.disconnectResult;
-            return backend.disconnectResult;
+          if (command === 'start_core') {
+            if (backend.startError) throw backend.startError;
+            backend.startedConfig = args.config;
+            backend.running = true;
+            backend.log = ['[meow] listening', '[meow] tun up'];
+            return {
+              running: true,
+              mode: args.mode,
+              pid: 4242,
+              configPath: 'C:\\Users\\x\\AppData\\Local\\io.cocoon.scpghost\\core\\config.yaml',
+              proxyUrl: 'http://127.0.0.1:7890',
+              log: backend.log,
+            };
           }
-          if (command === 'tunnel_test') return backend.testResult;
+          if (command === 'stop_core') {
+            backend.running = false;
+            backend.log = [];
+            return {
+              running: false,
+              mode: null,
+              pid: null,
+              configPath: null,
+              proxyUrl: 'http://127.0.0.1:7890',
+              log: [],
+            };
+          }
+          if (command === 'core_status') {
+            return {
+              running: backend.running,
+              mode: backend.running ? 'tun' : null,
+              pid: backend.running ? 4242 : null,
+              configPath: backend.running ? 'C:\\…\\config.yaml' : null,
+              proxyUrl: 'http://127.0.0.1:7890',
+              log: backend.log,
+            };
+          }
           throw new Error(`unknown command ${command}`);
         },
       },
     };
   }
 
-  window.eval(script);
-  return { dom, window, calls, backend, doc: window.document };
+  window.eval(coreConfig);
+  window.eval(mainJs);
+
+  return { dom, window, doc: window.document, calls, backend };
 }
 
-function button(doc, id) {
-  return doc.getElementById(id);
-}
+const $ = (doc, id) => doc.getElementById(id);
 
 async function main() {
-  // ── ۱) مسیر عادی: اتصال → تست → قطع ─────────────────────────
-  console.log('== connected flow ==');
-  const app = boot(true);
-  const { doc, calls, backend } = app;
-
+  // ── ۱) ساخت اولیه ────────────────────────────────────────────
+  console.log('== boot ==');
+  const app = boot();
   await tick();
-  check(calls.some((c) => c.command === 'status'), 'status is polled on boot');
-  check(button(doc, 'btn-connect').disabled === false, 'connect is enabled at rest');
-  check(button(doc, 'btn-disconnect').disabled === true, 'disconnect is disabled at rest');
-  check(button(doc, 'btn-test').disabled === true, 'tunnel test needs a session');
-  check(doc.getElementById('version').textContent === 'v5.2.6', 'version badge rendered');
+  check(app.calls.some((c) => c.command === 'core_status'), 'core status is polled on boot');
+  check($(app.doc, 'btn-connect').disabled === false, 'connect enabled at rest');
+  check($(app.doc, 'btn-disconnect').disabled === true, 'disconnect disabled at rest');
+  check($(app.doc, 'mode-badge').textContent === 'TUN', 'TUN mode is the default');
+  check($(app.doc, 'dot').dataset.state === 'off', 'dot starts idle');
 
-  button(doc, 'btn-connect').click();
+  // ── ۲) بررسی اشتراک ──────────────────────────────────────────
+  console.log('\n== subscription inspect ==');
+  $(app.doc, 'btn-fetch').click();
   await tick();
-  check(doc.getElementById('dot').dataset.state === 'on', 'status dot turns green');
+  check($(app.doc, 'node-info').hidden === false, 'node details are shown');
   check(
-    doc.getElementById('status-label').textContent === 'متصل و امن',
-    'label reads «متصل و امن»'
+    $(app.doc, 'node-server').textContent === 'edge.example.com:443',
+    'server:port rendered'
+  );
+  check($(app.doc, 'node-network').textContent === 'ws', 'transport rendered');
+  check(
+    $(app.doc, 'node-security').textContent.startsWith('tls'),
+    'security rendered'
   );
   check(
-    doc.getElementById('proxy').textContent === '127.0.0.1:8899',
-    'local proxy address is displayed'
+    $(app.doc, 'sub-state').textContent.includes('دریافت شد'),
+    'subscription size reported'
   );
-  check(
-    doc.getElementById('config-version').textContent === '5.1.1',
-    'config version comes from the handshake'
-  );
-  check(button(doc, 'btn-connect').disabled === true, 'connect locks after success');
-  check(button(doc, 'btn-disconnect').disabled === false, 'disconnect unlocks');
-  check(button(doc, 'btn-test').disabled === false, 'tunnel test unlocks');
-
-  doc.getElementById('test-target').value = 'https://www.youtube.com/robots.txt';
-  button(doc, 'btn-test').click();
-  await tick();
-  const testCall = calls.find((c) => c.command === 'tunnel_test');
-  check(
-    testCall && testCall.args && testCall.args.target === 'https://www.youtube.com/robots.txt',
-    'tunnel_test receives { target } in camelCase'
-  );
-  check(
-    doc.getElementById('test-result').textContent.startsWith('HTTP 200 · streaming'),
-    'result shows status + X-Ghost-Path'
-  );
-  check(doc.getElementById('test-result').className.includes('ok'), 'result marked as ok');
-
-  button(doc, 'btn-disconnect').click();
-  await tick();
-  check(doc.getElementById('dot').dataset.state === 'off', 'dot returns to idle');
-  check(doc.getElementById('proxy').textContent === '—', 'proxy address cleared');
-  check(button(doc, 'btn-test').disabled === true, 'tunnel test locks again');
   app.dom.window.close();
 
-  // ── ۲) خطای اتصال ────────────────────────────────────────────
-  console.log('\n== handshake failure ==');
-  const failing = boot(true);
-  failing.backend.failConnect = 'signaling HTTP 429: Too many session-init requests.';
-  failing.window.document.getElementById('btn-connect').click();
+  // ── ۳) اتصال کامل ────────────────────────────────────────────
+  console.log('\n== connect flow ==');
+  const run = boot();
   await tick();
+  $(run.doc, 'btn-connect').click();
+  await tick();
+
+  const startCall = run.calls.find((c) => c.command === 'start_core');
+  check(Boolean(startCall), 'start_core invoked');
+  check(startCall.args.mode === 'tun', 'mode forwarded to the backend');
   check(
-    failing.window.document.getElementById('dot').dataset.state === 'error',
-    'dot turns red on failure'
+    typeof startCall.args.config === 'string' &&
+      startCall.args.config.includes('proxies:') &&
+      startCall.args.config.includes('type: "vless"'),
+    'generated YAML forwarded to the core'
   );
   check(
-    failing.window.document.getElementById('status-hint').textContent.includes('429'),
-    'server message is surfaced to the user'
+    startCall.args.config.includes('tun:\n  enable: true'),
+    'TUN enabled in the generated config'
+  );
+  check($(run.doc, 'dot').dataset.state === 'on', 'dot turns green');
+  check($(run.doc, 'status-label').textContent === 'متصل', 'label reads «متصل»');
+  check($(run.doc, 'pid').textContent === '4242', 'core pid displayed');
+  check(
+    $(run.doc, 'proxy').textContent === 'http://127.0.0.1:7890',
+    'local proxy url displayed'
   );
   check(
-    failing.window.document.getElementById('btn-connect').disabled === false,
-    'connect can be retried'
+    $(run.doc, 'core-log').textContent.includes('tun up'),
+    'core log streamed into the UI'
+  );
+  check($(run.doc, 'btn-disconnect').disabled === false, 'disconnect unlocked');
+
+  $(run.doc, 'btn-disconnect').click();
+  await tick();
+  check(run.calls.some((c) => c.command === 'stop_core'), 'stop_core invoked');
+  check($(run.doc, 'dot').dataset.state === 'off', 'dot returns to idle');
+  check($(run.doc, 'pid').textContent === '—', 'pid cleared');
+  run.dom.window.close();
+
+  // ── ۴) حالت پراکسی محلی ──────────────────────────────────────
+  console.log('\n== proxy mode ==');
+  const proxy = boot();
+  await tick();
+  $(proxy.doc, 'mode-proxy').click();
+  check($(proxy.doc, 'mode-badge').textContent === 'PROXY', 'badge switches to PROXY');
+  check(
+    $(proxy.doc, 'mode-tun').classList.contains('active') === false,
+    'TUN segment deactivated'
+  );
+  $(proxy.doc, 'btn-connect').click();
+  await tick();
+  const proxyStart = proxy.calls.find((c) => c.command === 'start_core');
+  check(proxyStart.args.mode === 'proxy', 'proxy mode forwarded');
+  check(
+    proxyStart.args.config.includes('tun:\n  enable: false'),
+    'TUN disabled in proxy mode config'
+  );
+  proxy.dom.window.close();
+
+  // ── ۵) خطاها ─────────────────────────────────────────────────
+  console.log('\n== error paths ==');
+  const failing = boot();
+  await tick();
+  failing.backend.startError = 'sidecar «meow» پیدا نشد: not found';
+  $(failing.doc, 'btn-connect').click();
+  await tick();
+  check($(failing.doc, 'dot').dataset.state === 'error', 'dot turns red');
+  check(
+    $(failing.doc, 'status-hint').textContent.includes('sidecar'),
+    'backend error surfaced verbatim'
+  );
+  check(
+    failing.calls.some((c) => c.command === 'stop_core'),
+    'cleanup stop attempted after failure'
   );
   failing.dom.window.close();
 
-  // ── ۳) تست ناموفق (۴۰۳ ورکر) ─────────────────────────────────
-  console.log('\n== denied tunnel test ==');
-  const denied = boot(true);
-  denied.backend.connectResult = makeStatus({ connected: true, proxyPort: 8899 });
-  denied.backend.testResult = {
-    status: 403,
-    ok: false,
-    ghostPath: 'denied',
-    body: 'Forbidden: Target URL not allowed.',
-  };
-  denied.window.document.getElementById('btn-connect').click();
+  const badSub = boot({ subscription: '{"error":"Subscription endpoint is disabled"}' });
   await tick();
-  denied.window.document.getElementById('btn-test').click();
+  $(badSub.doc, 'btn-connect').click();
   await tick();
-  const resultEl = denied.window.document.getElementById('test-result');
-  check(resultEl.textContent.startsWith('HTTP 403 · denied'), 'denied path is shown');
-  check(resultEl.className.includes('fail'), 'failure styling applied');
-  denied.dom.window.close();
+  check($(badSub.doc, 'dot').dataset.state === 'error', 'invalid subscription blocks connect');
+  check(
+    /JSON/.test($(badSub.doc, 'status-hint').textContent),
+    'subscription parse error is explained'
+  );
+  badSub.dom.window.close();
 
-  // ── ۴) بدون پل Tauri ─────────────────────────────────────────
+  // ── ۶) بدون پل Tauri ─────────────────────────────────────────
   console.log('\n== no Tauri bridge ==');
-  const plain = boot(false);
-  const plainDoc = plain.window.document;
-  check(plainDoc.getElementById('bridge-warning').hidden === false, 'warning banner is visible');
-  check(plainDoc.getElementById('btn-connect').disabled === true, 'connect disabled in a plain browser');
-  check(plainDoc.getElementById('dot').dataset.state === 'error', 'dot shows the error state');
+  const plain = boot({ withBridge: false });
+  check($(plain.doc, 'bridge-warning').hidden === false, 'warning banner visible');
+  check($(plain.doc, 'btn-connect').disabled === true, 'connect disabled outside Tauri');
   plain.dom.window.close();
 
   console.log(`\n== summary: ${checks - failures.length}/${checks} passed ==`);
@@ -206,7 +256,7 @@ async function main() {
     failures.forEach((f) => console.log(`  - ${f}`));
     process.exit(1);
   }
-  console.log('UI wiring matches the Rust command surface');
+  console.log('UI wiring matches the controller surface');
 }
 
 main().catch((error) => {

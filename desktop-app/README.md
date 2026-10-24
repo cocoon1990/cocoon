@@ -1,124 +1,135 @@
-# SCP-GHOST Desktop (Tauri v2)
+# SCP-GHOST Desktop (Tauri v2 + هستهٔ meow)
 
-کلاینت دسکتاپ ویندوز برای تونل موجود. این پوشه کاملاً **مستقل** است: هیچ crate یا
-فایلی از `streaming-worker/`، `signaling-worker/`، `browser-wasm/`، `docs/` یا
-`config/` را import یا تغییر نمی‌دهد. ارتباط فقط از طریق اینترنت و همان قرارداد
-عمومی workerها انجام می‌شود.
+کلاینت دسکتاپ ویندوز. این پوشه کاملاً **مستقل** است: هیچ crate یا فایلی از
+`streaming-worker/`، `signaling-worker/`، `browser-wasm/`، `docs/` یا `config/`
+را import یا تغییر نمی‌دهد.
 
-```
-desktop-app/
-├── src/                        رابط کاربری — HTML/CSS/JS خالص، بدون باندلر
-│   ├── index.html
-│   ├── styles.css
-│   └── main.js                 فقط نمایش؛ هیچ رمزنگاری‌ای در JS نیست
-├── src-tauri/                  هستهٔ Rust
-│   ├── Cargo.toml              tauri 2 + x25519-dalek + aes-gcm + hkdf + ureq
-│   ├── build.rs
-│   ├── tauri.conf.json         پنجره، بسته‌بندی nsis/msi، آیکون‌ها
-│   ├── capabilities/           مجوز حداقلی (core:default)
-│   ├── icons/                  تولیدشده توسط tools/gen_icons.py
-│   └── src/main.rs             handshake + امضا + پراکسی محلی
-└── tools/                      اسکریپت‌های اعتبارسنجی (بدون وابستگی به Rust)
-    ├── verify_config.py        ساختار config، آیکون‌ها، هم‌خوانی دستورها
-    ├── protocol_parity.py      هم‌خوانی بایت‌به‌بایت با workerها
-    ├── test_ui.cjs             آزمون DOM رابط کاربری (jsdom)
-    └── gen_icons.py            تولید آیکون‌ها بدون وابستگی خارجی
-```
+> **بازطراحی (v5.3.0):** تمام کد پراکسی دست‌ساز (X25519، HMAC، سوکت TCP، ساخت
+> TUN) حذف شد. حالا یک هستهٔ پراکسی واقعی و متن‌باز (`meow`) به‌صورت **sidecar**
+> اجرا می‌شود و Tauri فقط رابط کاربری و کنترل‌کننده است.
+
+## چرا «meow»؟
+
+| کاندید | زبان | VLESS | REALITY | TUN ویندوز | وضعیت |
+|---|---|---|---|---|---|
+| **meow-rs** | Rust | ✅ + XTLS-Vision | ✅ | ✅ Wintun | v0.26.1 (۲۰۲۶-۱۰-۲۱) |
+| mihomo | Go | ✅ | ✅ | ✅ Wintun | v1.19.33 — بالغ‌ترین مرجع |
+| sing-box | Go | ✅ | ✅ | ✅ | v1.13.x |
+| Xray-core | Go | ✅ (مرجع) | ✅ | TUN حداقلی | v26.3.x |
+| shoes | Rust | — | — | — | کتابخانه، نه هستهٔ کامل |
+
+`meow` ری‌رایت Rust هستهٔ mihomo است: کانفیگ YAML سازگار، VLESS/REALITY/XTLS-Vision،
+آداپتور Wintun روی ویندوز (فایل‌های رسمی `wintun.dll` را همراه دارند)، و REST API
+سازگار با Clash. تنها کاندید Rust است که هر سه نیاز (VLESS + REALITY + TUN) را
+پوشش می‌دهد.
+
+**صادقانه:** نسخهٔ ۰.x است و در حال حاضر باگ‌های TUN فعالانه رفع می‌شوند؛ به
+بلوغ mihomo نیست. به همین دلیل:
+
+- کانفیگ تولیدشده **mihomo-compatible** است؛ اگر پایداری meow کافی نبود، فقط
+  باینری sidecar را با `mihomo.exe` عوض کنید — هیچ خط دیگری تغییر نمی‌کند.
+- نسخه در `.github/workflows/build-desktop.yml` (متغیر `CORE_VERSION`) پین شده و
+  checksum SHA-256 آن پیش از بسته‌بندی تأیید می‌شود.
 
 ## معماری
 
-| لایه | مسئولیت |
-|---|---|
-| `main.js` | دکمه‌ها، وضعیت، لاگ، نمایش نتیجه. صفر رمزنگاری. |
-| `main.rs` | X25519 + HKDF + AES-GCM (handshake)، HMAC-SHA256 (امضا)، HTTP، پراکسی |
-| `ureq` (blocking) | تنها کلاینت شبکه، روی یک thread جدا (`spawn_blocking`) |
-
-**چرا کلید خصوصی هیچ‌وقت ذخیره نمی‌شود؟** کلید X25519 در همان تابع
-`perform_handshake` ساخته و مصرف می‌شود و از scope آن بیرون نمی‌رود. تنها چیزی که
-نگه داشته می‌شود `hmac_key` است که با `zeroize` در `Drop` پاک می‌شود.
-
-## قرارداد پروتکل (عیناً همان نسخهٔ وب)
-
 ```
-POST {SIGNALING}/session-init
-  → {"client_pubkey": base64(32 raw bytes), "client_version": "5.2.6"}
-  ← {"protocol": "x25519-hkdf-sha256-aesgcm-v1",
-     "server_pubkey": b64(32), "salt": b64(32),
-     "wrapped": b64(nonce12 ‖ ct ‖ tag16), "config_version": "..."}
-
-shared = X25519(client_priv, server_pub)
-kek    = HKDF-SHA256(salt, shared, info="ghost/session-kek/v1", len=32)
-AAD    = "ghost/session/v1" ‖ client_pub_raw ‖ server_pub_raw
-plain  = AES-256-GCM-decrypt(kek, wrapped)  → {"hmac_key_hex", "aes_key_hex"}
-
-GET {STREAMING}/stream?target=percent(target)&sig=&seq=
-  message = "{target}:{seq}"
-  key     = hex::decode(hmac_key_hex)        ← ۳۲ بایت، نه ۶۴ بایت ASCII
-  sig     = hex(HMAC-SHA256(key, message))   ← ۶۴ کاراکتر hex
+┌──────────────────────────── SCP-GHOST.exe (Tauri) ───────────────────────────┐
+│  src/index.html + styles.css + main.js     رابط کاربری (فقط نمایش)           │
+│  src/core-config.js                        URI → YAML  (تنها تبدیل داده‌ای)   │
+│  src-tauri/src/main.rs                     کنترلر: GET اشتراک، نوشتن فایل،   │
+│                                            اجرا/توقف sidecar، جمع‌آوری لاگ     │
+└───────────────────────────────────┬──────────────────────────────────────────┘
+                                    │  spawn  meow -d <dir> -f <config.yaml>
+┌───────────────────────────────────▼──────────────────────────────────────────┐
+│  meow.exe  (sidecar، Rust)                                                   │
+│  TUN/Wintun + DNS fake-ip + VLESS(WS/TLS یا REALITY) + قوانین مسیریابی       │
+└───────────────────────────────────┬──────────────────────────────────────────┘
+                                    │  VLESS over TLS/WS
+                            ┌───────▼────────┐
+                            │ Cloudflare      │   /sub  → URI نود
+                            │ streaming-worker│
+                            └───────┬────────┘
+                                    │  (VLESS_HOST)
+                            سرور VLESS واقعی (Xray/sing-box/…)
 ```
 
-سه نکته که دقیقاً همان اشتباهات گذشته را تکرار نمی‌کنند:
+هیچ کد شبکه/TUN/TLS در Rust این برنامه نیست؛ `verify_config.py` این را به‌صورت
+خودکار بررسی می‌کند (`TcpListener`، `X25519`، `aes_gcm`، `Hmac` و `create_tun`
+نباید در `main.rs` باشند).
 
-1. **کلید HMAC** با `hex::decode` ساخته می‌شود (۳۲ بایت). استفاده از
-   `hex_string.as_bytes()` (۶۴ بایت ASCII) همان باگ v5.2.5 است.
-2. **خروجی امضا** با `hex::encode` به رشته تبدیل می‌شود، نه بایت خام.
-3. **target** با درصدگذاری RFC 3986 در query می‌رود (`+` → `%2B`). بدون این،
-   ورکر `+` را فاصله decode می‌کند و امضا نمی‌خواند.
+## جریان کار
 
-## پراکسی محلی — دامنهٔ واقعی
+1. کاربر آدرس اشتراک (`https://…/sub?token=…`) را می‌دهد.
+2. Rust متن اشتراک را می‌گیرد (بدون درگیری CORS در webview).
+3. `core-config.js` آن را Base64-decode می‌کند، نود `vless://` را پارس می‌کند و
+   YAML می‌سازد.
+4. Rust فایل را در `%LOCALAPPDATA%\io.cocoon.scpghost\core\config.yaml` می‌نویسد.
+5. `meow.exe -d <همان پوشه> -f config.yaml` اجرا می‌شود.
+6. لاگ هسته هر ۱٫۲ ثانیه به UI خوانده می‌شود؛ توقف = `kill` واقعی فرایند.
 
-روی `127.0.0.1:8899` گوش می‌دهد (اگر اشغال باشد: پورت آزاد سیستم).
+### حالت‌ها
 
-| درخواست | رفتار |
-|---|---|
-| `GET http://<allowlist>/...` | امضا و عبور از `/stream` |
-| `GET http://<سایر دامنه‌ها>/...` | `403` با توضیح allowlist |
-| `CONNECT host:443` | `501` — بک‌اند تونل TLS خام ندارد |
-| متد غیر GET | `405` |
-| بدون اتصال | `503` |
+| حالت | چه چیزی عبور می‌کند | دسترسی |
+|---|---|---|
+| **TUN** | همهٔ ترافیک ویندوز (آداپتور Wintun) | مدیر (برنامه با UAC بالا می‌آید) |
+| **پراکسی محلی** | برنامه‌هایی که از `http://127.0.0.1:7890` استفاده می‌کنند | کاربر عادی |
 
-این یک **forward-proxy کامل نیست** و ادعای آن هم نمی‌شود: `/stream` یک پل GET روی
-پنج دامنهٔ مجاز است، نه `CONNECT`. بنابراین نمی‌تواند ترافیک کل ویندوز را حمل کند؛
-برای آن معماری بک‌اند باید یک تونل واقعی (CONNECT/QUIC) داشته باشد. کاری که این
-برنامه واقعاً انجام می‌دهد: handshake واقعی، امضای واقعی، عبور واقعی محتوا از
-دامنه‌های مجاز، و گزارش شفاف `X-Ghost-Path` برای هر hop.
+## بسته‌بندی sidecar
 
-## ساخت
+`tauri.conf.json` → `bundle.externalBin: ["binaries/meow"]`، و فایل باید با نام
+هدف سه‌گانه موجود باشد:
 
-### خودکار (توصیه‌شده)
+```
+src-tauri/binaries/meow-x86_64-pc-windows-msvc.exe
+```
 
-`.github/workflows/build-desktop.yml` روی هر push به `main` که `desktop-app/**` را
-تغییر دهد، ویندوز را می‌سازد و نصب‌کننده‌ها را به GitHub Releases می‌گذارد.
-
-| رویداد | نتیجه |
-|---|---|
-| Pull Request | `cargo check` + اعتبارسنجی + ساخت کامل ویندوز (بدون انتشار) |
-| Push به `main` | همان + انتشار در Release با تگ `desktop-v5.2.6` |
-| اجرای دستی | ساخت؛ انتشار فقط اگر روی `main` باشد |
-
-### دستی (روی ویندوز)
+این پوشه gitignore شده است؛ CI آن را در زمان build دانلود و checksum را تأیید
+می‌کند. برای build محلی:
 
 ```powershell
-# پیش‌نیازها: Rust stable (MSVC)، Node.js، WebView2 (در ویندوز ۱۱ از پیش نصب است)
+$v = 'v0.26.1'; $a = "meow-$v-x86_64-pc-windows-msvc.zip"
+$b = "https://github.com/meow-rs/meow-rs/releases/download/$v"
+Invoke-WebRequest "$b/$a" -OutFile core.zip
+Expand-Archive core.zip -DestinationPath core -Force
+New-Item -ItemType Directory -Force desktop-app/src-tauri/binaries | Out-Null
+Copy-Item core/meow.exe desktop-app/src-tauri/binaries/meow-x86_64-pc-windows-msvc.exe
+Copy-Item core/wintun.dll desktop-app/src-tauri/binaries/ -ErrorAction SilentlyContinue
+```
+
+## ساخت و اجرا
+
+```powershell
 npm install -g @tauri-apps/cli@v2
 cd desktop-app
-tauri build            # یا: tauri dev
+tauri dev      # یا: tauri build
 ```
 
 خروجی:
 
 ```
-src-tauri/target/release/bundle/nsis/SCP-GHOST_5.2.6_x64-setup.exe
-src-tauri/target/release/bundle/msi/SCP-GHOST_5.2.6_x64_en-US.msi
+src-tauri/target/release/bundle/nsis/SCP-GHOST_5.3.0_x64-setup.exe
+src-tauri/target/release/bundle/msi/SCP-GHOST_5.3.0_x64_en-US.msi
 ```
 
-## اعتبارسنجی بدون ویندوز
+## آزمون‌ها (بدون نیاز به Rust)
 
 ```bash
-python3 desktop-app/tools/verify_config.py     # ساختار config، آیکون‌ها، دستورها
-python3 desktop-app/tools/protocol_parity.py   # نیازمند: pip install cryptography
-node    desktop-app/tools/test_ui.cjs          # نیازمند: npm install jsdom
+node   desktop-app/tools/test_core_config.cjs   # ۵۱ آزمون — پارس URI و YAML
+python3 desktop-app/tools/verify_config.py     # config، آیکون، مانیفست، sidecar، «نبود کد سفارشی»
+NODE_PATH=<node_modules> node desktop-app/tools/test_ui.cjs   # ۳۴ آزمون DOM با jsdom
 python3 desktop-app/tools/gen_icons.py         # بازتولید آیکون‌ها
 ```
 
-سه مورد اول در CI هم اجرا می‌شوند و `cargo check` تنها دروازهٔ کامپایل Rust است.
+`tools/out/*.yaml` خروجی تست اول است و `verify_config.py` همان‌ها را با یک پارسر
+واقعی YAML بازمی‌خواند. آزمون DOM اختیاری است (نیازمند `npm install jsdom`).
+
+## نکتهٔ مهم دربارهٔ این بک‌اند
+
+`streaming-worker` خودش **سرور VLESS نیست** (در سورس هم همین را می‌گوید). `/sub`
+فقط یک URI استاندارد می‌سازد که به `VLESS_HOST` اشاره می‌کند و بدون تنظیم
+`SUB_TOKEN` / `VLESS_UUID` / `VLESS_HOST` با خطا بسته می‌شود (fail-closed).
+
+یعنی این برنامه وقتی تونل واقعی می‌شود که آن upstream وجود داشته باشد. اگر `/sub`
+خطا برگرداند، برنامه همان پیام سرور را نشان می‌دهد و هسته را اجرا نمی‌کند —
+هیچ تونل جعلی ساخته نمی‌شود.
