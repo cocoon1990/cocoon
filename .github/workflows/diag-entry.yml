@@ -78,12 +78,16 @@ jobs:
           EOF
 
           probe() { # $1=label  $2=main  $3=config-suffix (optional)
-            sed -e "s#^main .*#main = \"$2\"#" wrangler.toml > /tmp/w.toml
-            if [ "${3:-}" = "noflag" ]; then sed -i '/compatibility_flags/d' /tmp/w.toml; fi
+            # کانفیگ باید **کنار** wrangler.toml بماند؛ وگرنه main نسبی
+            # نسبت به /tmp حل می‌شود و deploy با «file not found» می‌میرد.
+            CFG="wrangler.diag-$1.toml"
+            sed -e "s#^main .*#main = \"$2\"#" wrangler.toml > "$CFG"
+            if [ "${3:-}" = "noflag" ]; then sed -i '/compatibility_flags/d' "$CFG"; fi
             set +e
-            npx --yes wrangler@latest deploy -c /tmp/w.toml > "/tmp/d-$1.log" 2>&1
+            npx --yes wrangler@latest deploy -c "$CFG" > "/tmp/d-$1.log" 2>&1
             RC=$?
             set -e
+            rm -f "$CFG"
             sleep 12
             CODE=000; BODY=""
             for attempt in 1 2 3; do
@@ -92,7 +96,8 @@ jobs:
               [ "$CODE" = "200" ] && break
               sleep 8
             done
-            printf '%s | deploy=%s | health=%s | %s\n' "$1" "$RC" "$CODE" "$BODY" >> "$OUT"
+            WHY=$(grep -aoE 'ERROR\][^\[]{0,140}' "/tmp/d-$1.log" 2>/dev/null | head -1 | tr -d '\r' | cut -c1-140)
+            printf '%s | deploy=%s | health=%s | %s | %s\n' "$1" "$RC" "$CODE" "$BODY" "$WHY" >> "$OUT"
           }
 
           probe A-current-entry  src/entry.mjs
@@ -104,8 +109,9 @@ jobs:
           echo "::error title=entry-shapes::$MSG"
 
           # آخرین دیپلوی را به کنترلِ سالم برگردان (تا worker از مرده‌بودن دربیاید)
-          sed -e 's#^main .*#main = "build/worker/shim.mjs"#' wrangler.toml > /tmp/w-final.toml
-          npx --yes wrangler@latest deploy -c /tmp/w-final.toml > /tmp/d-final.log 2>&1 || true
+          sed -e 's#^main .*#main = "build/worker/shim.mjs"#' wrangler.toml > wrangler.diag-final.toml
+          npx --yes wrangler@latest deploy -c wrangler.diag-final.toml > /tmp/d-final.log 2>&1 || true
+          rm -f wrangler.diag-final.toml
           sleep 12
           curl -sS -o /tmp/f.txt -w 'final health=%{http_code}\n' --max-time 15 "$URL/health?cb=$GITHUB_RUN_ID-final" || true
           head -c 160 /tmp/f.txt || true
