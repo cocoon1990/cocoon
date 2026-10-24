@@ -6,7 +6,7 @@
   <title>SCP-GHOST — Phantom Citadel</title>
 
   <!--
-    docs/index.html — SCP-GHOST v5.1.4 UI
+    docs/index.html — SCP-GHOST v5.2.0 UI
     این صفحه:
       ۱. Service Worker را ثبت می‌کند
       ۲. Session keys را از Signaling Worker می‌خواند
@@ -294,6 +294,58 @@
     .btn--danger:hover { background: rgba(248,81,73,0.1); }
     .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+    /* ── Tunnel Test ──────────────────────────────────────── */
+    .tunnel-test__row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+
+    .input {
+      flex: 1 1 260px;
+      min-width: 0;
+      padding: 0.5rem 0.75rem;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      font-size: 0.8rem;
+      font-family: var(--font-mono);
+      transition: border-color var(--transition);
+    }
+
+    .input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    .tunnel-test__meta {
+      margin-top: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      word-break: break-word;
+    }
+
+    .tunnel-test__out {
+      margin-top: 0.75rem;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      line-height: 1.6;
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) - 2px);
+      padding: 0.875rem 1rem;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      direction: ltr;
+      text-align: left;
+    }
+
     /* ── Footer ───────────────────────────────────────────── */
     .footer {
       text-align: center;
@@ -311,7 +363,7 @@
   <!-- ── Header ─────────────────────────────────────────── -->
   <header class="header">
     <div class="header__logo">SCP-GHOST</div>
-    <div class="header__subtitle">Operation Phantom Citadel — v5.1.4</div>
+    <div class="header__subtitle">Operation Phantom Citadel — v5.2.0</div>
     <span class="header__version" id="sw-version">SW: loading...</span>
   </header>
 
@@ -404,11 +456,38 @@
     <div class="log-output" id="event-log"></div>
   </div>
 
+  <!-- ── Test Tunnel ────────────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">تست تونل</div>
+
+    <div class="tunnel-test__row">
+      <input
+        class="input"
+        id="tunnel-test-url"
+        type="url"
+        dir="ltr"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Tunnel test URL"
+        value="https://api.ipify.org?format=json"
+      />
+      <button class="btn btn--primary" id="btn-tunnel-test" onclick="runTunnelTest()">
+        🧪 Fetch via Tunnel
+      </button>
+    </div>
+
+    <div class="tunnel-test__meta" id="tunnel-test-meta">
+      آماده — دکمه را بزنید.
+    </div>
+
+    <pre class="tunnel-test__out" id="tunnel-test-output" dir="ltr">—</pre>
+  </div>
+
 </div><!-- /container -->
 
 <!-- ── Footer ───────────────────────────────────────────── -->
 <footer class="footer">
-  SCP-GHOST v5.1.4 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
+  SCP-GHOST v5.2.0 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
 </footer>
 
 <script type="module">
@@ -424,7 +503,7 @@
 
 // این مقدار توسط deploy-pages.yml inject می‌شود
 const SIGNALING_URL = "__CF_SIGNALING_URL__";
-const SW_VERSION    = "5.1.4";
+const SW_VERSION    = "5.2.0";
 
 let swRegistration  = null;
 let configVersion   = "—";
@@ -1051,6 +1130,139 @@ window.addEventListener("beforeunload", () => {
   }
   stopStatsRefresh();
 });
+
+// ──────────────────────────────────────────────────────────────
+//  Tunnel Test — آیا fetch این صفحه واقعاً از SW عبور می‌کند؟
+//
+//  چرا «HTTP 200» به‌تنهایی جواب نیست:
+//    • فقط وقتی درخواست از SW عبور می‌کند که صفحه controlled باشد.
+//    • SW فقط وقتی به streaming-worker route می‌دهد که routerReady و
+//      session هر دو آماده باشند؛ وگرنه fetch(request) = pass-through.
+//    • پس وضعیت خودِ SW منبع حقیقت است، نه status code پاسخ.
+// ──────────────────────────────────────────────────────────────
+const TUNNEL_TEST_DEFAULT = "https://api.ipify.org?format=json";
+
+function setTunnelTestOutput(text) {
+  const out = $("tunnel-test-output");
+  if (out) out.textContent = text;
+}
+
+function setTunnelTestMeta(text) {
+  const meta = $("tunnel-test-meta");
+  if (meta) meta.textContent = text;
+}
+
+// پیام دقیق fail — هم در Event Log، هم زیر دکمه
+function reportTunnelFailure(reason) {
+  log(`❌ Tunnel failed: ${reason}`, "error");
+  setTunnelTestMeta(`❌ Tunnel failed: ${reason}`);
+  return false;
+}
+
+window.runTunnelTest = async function () {
+  const input = $("tunnel-test-url");
+  const btn = $("btn-tunnel-test");
+  const url = ((input && input.value) || "").trim() || TUNNEL_TEST_DEFAULT;
+
+  if (btn) btn.disabled = true;
+  setTunnelTestOutput("—");
+  setTunnelTestMeta("در حال ارسال درخواست...");
+  log(`تست تونل: GET ${url}`, "muted");
+
+  try {
+    if (!("serviceWorker" in navigator)) {
+      return reportTunnelFailure("مرورگر از Service Worker پشتیبانی نمی‌کند.");
+    }
+
+    // بدون controller، fetch مستقیماً به شبکه می‌رود و SW آن را نمی‌بیند.
+    if (!navigator.serviceWorker.controller) {
+      return reportTunnelFailure(
+        "این صفحه توسط Service Worker کنترل نمی‌شود، پس درخواست مستقیم به شبکه می‌رود. صفحه را reload کنید."
+      );
+    }
+
+    // وضعیت واقعی SW تعیین می‌کند route می‌شود یا pass-through
+    const sw = swRegistration?.active || navigator.serviceWorker.controller;
+    const status = await requestServiceWorkerStatus(sw, 2000);
+
+    if (!status) {
+      return reportTunnelFailure("پاسخی از Service Worker دریافت نشد (GET_STATUS timeout).");
+    }
+
+    if (!status.routerReady) {
+      return reportTunnelFailure(
+        `Router آماده نیست (wasm=${status.wasmLoaded}, router=${status.routerReady}) — درخواست pass-through می‌شود.`
+      );
+    }
+
+    if (!status.hasSession) {
+      return reportTunnelFailure(
+        "Session فعال نیست — اول دکمهٔ «اتصال و Init Session» را بزنید؛ بدون آن SW نمی‌تواند URL را امضا کند."
+      );
+    }
+
+    let resp;
+    try {
+      resp = await fetch(url, { cache: "no-store" });
+    } catch (netErr) {
+      return reportTunnelFailure(`خطای شبکه/CORS: ${netErr.message}`);
+    }
+
+    const body = await resp.text();
+    setTunnelTestOutput(body || "(پاسخ خالی)");
+
+    const viaStreaming = (resp.headers.get("X-Ghost-Path") || "").toLowerCase() === "streaming";
+    const swStreamingError = body.trim() === "Streaming Error";
+
+    // اگر پاسخ JSON با فیلد ip بود، IP خروجی را نشان بده
+    let egressIp = null;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed.ip === "string") egressIp = parsed.ip;
+    } catch (_) {
+      egressIp = null;
+    }
+
+    const detail =
+      `HTTP ${resp.status}` +
+      ` · router=${status.routerReady}, session=${status.hasSession}` +
+      ` · path=${viaStreaming ? "streaming" : "pass-through"}` +
+      (egressIp ? ` · IP خروجی: ${egressIp}` : "");
+
+    // ✅ فقط وقتی که واقعاً از مسیر streaming-worker برگشته باشد
+    if (resp.ok && viaStreaming) {
+      log("✅ Tunnel is working!", "ok");
+      log(`جزئیات: ${detail}`, "muted");
+      setTunnelTestMeta(`✅ Tunnel is working! — ${detail}`);
+      return true;
+    }
+
+    // 502 + بدنهٔ «Streaming Error» یعنی: SW intercept کرد، worker رد کرد
+    if (swStreamingError) {
+      reportTunnelFailure(
+        `درخواست intercept و به streaming-worker فرستاده شد، اما worker آن را رد کرد (${resp.status}). ` +
+          `مقصد باید در allowlist باشد؛ مثلاً https://www.youtube.com/robots.txt را امتحان کنید.`
+      );
+      log(`جزئیات: ${detail}`, "muted");
+      return false;
+    }
+
+    if (resp.ok && !viaStreaming) {
+      return reportTunnelFailure(
+        `پاسخ ${resp.status} رسید اما نشانهٔ مسیر streaming دیده نشد ` +
+          `(هدر X-Ghost-Path غایب است). ${detail}`
+      );
+    }
+
+    reportTunnelFailure(
+      `پاسخ ناموفق ${resp.status}${resp.statusText ? " " + resp.statusText : ""}.`
+    );
+    log(`جزئیات: ${detail}`, "muted");
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+};
 
 // ──────────────────────────────────────────────────────────────
 //  Init on load
