@@ -240,20 +240,42 @@ jobs:
           echo "uuid tail: ${UUID: -4}"
 
       # ── Deploy ─────────────────────────────────────────────
+      # عمداً با `npx wrangler@latest` و نه wrangler-action: تنها دیپلوی‌هایی
+      # که روی Mainnet ۲۰۰ دادند با همین wrangler انجام شدند؛ اکشن با
+      # wrangler قدیمی‌ترش باندل متفاوتی می‌سازد که 1101 می‌دهد.
       - name: Deploy streaming-worker to Cloudflare Edge
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          command: deploy
-          workingDirectory: streaming-worker
-          secrets: |
-            HMAC_SECRET
-            VLESS_UUID
-            SUB_TOKEN
+        working-directory: streaming-worker
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          if ! npx --yes wrangler@latest deploy > /tmp/deploy.log 2>&1; then
+            MSG=$(tail -n 15 /tmp/deploy.log | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-900)
+            echo "::error title=streaming deploy::$MSG"
+            exit 1
+          fi
+          tail -n 10 /tmp/deploy.log
+
+      - name: Upload the worker secrets
+        working-directory: streaming-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           HMAC_SECRET: ${{ secrets.HMAC_SECRET }}
           VLESS_UUID: ${{ steps.vless.outputs.uuid }}
           SUB_TOKEN: ${{ steps.vless.outputs.token }}
+        run: |
+          set -u
+          for name in HMAC_SECRET VLESS_UUID SUB_TOKEN; do
+            value=$(eval "printf '%s' \"\$$name\"")
+            if [ -z "$value" ]; then echo "::warning title=secret::$name is empty"; continue; fi
+            if printf '%s' "$value" | npx --yes wrangler@latest secret put "$name" >/tmp/secret-$name.log 2>&1; then
+              echo "✅ $name"
+            else
+              MSG=$(tail -n 6 /tmp/secret-$name.log | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | cut -c1-500)
+              echo "::error title=secret $name::$MSG"
+              exit 1
+            fi
+          done
 
       # ── Deploy the standalone JS VLESS worker ──────────────
       # صفر wasm، صفر binding: فقط WebSocketPair + cloudflare:sockets.
@@ -266,7 +288,7 @@ jobs:
         run: |
           set -u
           if ! npx --yes wrangler@latest deploy -c wrangler.vless.toml > /tmp/vless-deploy.log 2>&1; then
-            MSG=$(grep -aoE 'ERROR\][^\[]{0,200}' /tmp/vless-deploy.log | head -2 | tr '\n' ' ' | cut -c1-500)
+            MSG=$(tail -n 15 /tmp/vless-deploy.log | cut -c1-200)
             MSG2=$(sed -e 's/%/%25/g' "$MSG" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
             echo "::error title=VLESS worker deploy::$MSG2"
             tail -n 15 /tmp/vless-deploy.log
