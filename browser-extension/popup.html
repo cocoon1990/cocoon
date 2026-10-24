@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <title>SCP-GHOST</title>
+  <style>
+    :root {
+      --bg: #0d1117; --card: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e;
+      --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+      --mono: "Cascadia Code", Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 280px; background: var(--bg); color: var(--text);
+      font: 13px/1.6 "Vazirmatn", "Segoe UI", system-ui, sans-serif;
+      padding: 14px; display: flex; flex-direction: column; gap: 10px;
+    }
+    h1 { font-size: 12px; letter-spacing: .06em; color: var(--muted);
+         text-transform: uppercase; font-family: var(--mono); }
+    .status {
+      display: flex; align-items: center; gap: 8px;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+    .dot--ok   { background: var(--green); }
+    .dot--err  { background: var(--red); }
+    .dot--busy { background: var(--blue); }
+    #status-text { font-size: 12px; }
+    .actions { display: flex; gap: 8px; }
+    button {
+      flex: 1; padding: 8px 10px; border-radius: 6px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      font: inherit; font-size: 12px; transition: .15s;
+    }
+    button:hover:not(:disabled) { border-color: #484f58; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    #btn-connect { background: var(--blue); border-color: var(--blue); color: #0d1117; font-weight: 600; }
+    #btn-disconnect { color: var(--red); border-color: var(--red); }
+    .meta { font-family: var(--mono); font-size: 10px; color: var(--muted); word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>SCP-GHOST</h1>
+
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="status-text">در حال بررسی...</span>
+  </div>
+
+  <div class="actions">
+    <button id="btn-connect">اتصال</button>
+    <button id="btn-disconnect" disabled>قطع</button>
+  </div>
+
+  <div class="meta" id="meta"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
