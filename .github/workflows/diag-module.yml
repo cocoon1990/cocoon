@@ -1,0 +1,40 @@
+name: "🔬 Diagnostic — module graph"
+on:
+  workflow_dispatch:
+  push:
+    branches: ["arena/e7cabfe8-cocoon"]
+    paths: [".github/workflows/diag-module.yml", "tools/probes/**"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      SUB: cocoon-de9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: variants
+        run: |
+          set +e
+          OUT=/tmp/r.txt; : > "$OUT"
+          probe() {
+            NAME="$1"; SRC="$2"
+            mkdir -p "/tmp/v/$NAME"; cp "$SRC" "/tmp/v/$NAME/entry.mjs"
+            cp streaming-worker/src/vless.js "/tmp/v/$NAME/vless.js" 2>/dev/null
+            printf 'name = "ghost-t-%s"\nmain = "entry.mjs"\ncompatibility_date = "2025-10-01"\nworkers_dev = true\n' "$NAME" > "/tmp/v/$NAME/wrangler.toml"
+            ( cd "/tmp/v/$NAME" && npx --yes wrangler@latest deploy > d.log 2>&1; echo "deploy=$?" )
+            sleep 12
+            CODE=$(curl -sS -o "/tmp/v/$NAME/b.txt" -w '%{http_code}' --max-time 15 "https://ghost-t-$NAME.$SUB.workers.dev/?cb=$GITHUB_RUN_ID")
+            printf 'ghost-t-%s | %s | %s\n' "$NAME" "$CODE" "$(head -c 60 "/tmp/v/$NAME/b.txt" | tr '\n' ' ')" >> "$OUT"
+            ( cd "/tmp/v/$NAME" && npx --yes wrangler@latest delete --name "ghost-t-$NAME" --force >/dev/null 2>&1 )
+          }
+          probe sockets  tools/probes/sockets.mjs
+          probe modonly  tools/probes/modonly.mjs
+          probe wspair   tools/probes/wspair.mjs
+          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}')
+          echo "::error title=module-graph::$MSG"
