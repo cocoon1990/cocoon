@@ -1,0 +1,9 @@
+# خروجی‌های ساخت Tauri/Rust — هرگز commit نمی‌شوند
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# فایل‌های موقت ویندوز
+*.pdb
+*.exp
+*.lib
+*.ilk

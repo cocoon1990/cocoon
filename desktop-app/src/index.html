@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SCP-GHOST</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <!-- ── هدر ─────────────────────────────────────────────── -->
+    <header class="head">
+      <div class="mark" aria-hidden="true">
+        <span class="mark-dot"></span>
+      </div>
+      <div class="head-text">
+        <h1>SCP-GHOST</h1>
+        <p class="sub">کلاینت دسکتاپ &mdash; تونل امضاشده</p>
+      </div>
+      <span class="ver" id="version" title="نسخهٔ برنامه">v&mdash;</span>
+    </header>
+
+    <!-- ── وضعیت ───────────────────────────────────────────── -->
+    <section class="card status-card" aria-live="polite">
+      <div class="status-row">
+        <span class="dot" id="dot" data-state="off"></span>
+        <div class="status-text">
+          <strong id="status-label">قطع</strong>
+          <small id="status-hint">برای شروع، اتصال را برقرار کنید.</small>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-connect" class="btn primary" type="button">اتصال</button>
+        <button id="btn-disconnect" class="btn ghost" type="button" disabled>قطع</button>
+      </div>
+    </section>
+
+    <!-- ── جزئیات ──────────────────────────────────────────── -->
+    <section class="card">
+      <h2>جزئیات اتصال</h2>
+      <dl class="kv">
+        <div class="kv-row">
+          <dt>پراکسی محلی</dt>
+          <dd>
+            <code id="proxy" dir="ltr">&mdash;</code>
+            <button id="btn-copy" class="mini" type="button" title="کپی آدرس">کپی</button>
+          </dd>
+        </div>
+        <div class="kv-row">
+          <dt>نسخهٔ کانفیگ</dt>
+          <dd><code id="config-version" dir="ltr">&mdash;</code></dd>
+        </div>
+        <div class="kv-row">
+          <dt>شمارندهٔ امضا</dt>
+          <dd><code id="seq" dir="ltr">0</code></dd>
+        </div>
+        <div class="kv-row">
+          <dt>بک‌اند</dt>
+          <dd><code id="endpoint" dir="ltr" class="trunc">&mdash;</code></dd>
+        </div>
+      </dl>
+      <p class="note">
+        دسترسی فقط برای دامنه‌های مجاز تونل و فقط روی <code dir="ltr">GET</code> است؛
+        این برنامه forward-proxy عمومی نیست.
+      </p>
+    </section>
+
+    <!-- ── تست تونل ────────────────────────────────────────── -->
+    <section class="card">
+      <h2>تست تونل</h2>
+      <div class="test-row">
+        <input id="test-target" type="url" dir="ltr"
+               value="https://www.youtube.com/robots.txt"
+               placeholder="https://www.youtube.com/robots.txt" spellcheck="false" />
+        <button id="btn-test" class="btn" type="button" disabled>اجرا</button>
+      </div>
+      <pre id="test-result" class="result" dir="ltr" hidden></pre>
+    </section>
+
+    <!-- ── لاگ ─────────────────────────────────────────────── -->
+    <section class="card">
+      <h2>رویدادها</h2>
+      <ul id="log" class="log" aria-live="polite"></ul>
+    </section>
+
+    <p id="bridge-warning" class="banner" hidden>
+      پل Tauri در دسترس نیست &mdash; این صفحه فقط داخل برنامهٔ دسکتاپ کار می‌کند.
+    </p>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>

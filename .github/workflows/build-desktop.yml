@@ -1,0 +1,148 @@
+name: build-desktop
+
+# ساخت و انتشار برنامهٔ ویندوز (Tauri v2) — فقط از پوشهٔ desktop-app
+# هیچ‌کدام از workerها، docs یا browser-wasm در این مسیر دست نمی‌خورند.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-app/**'
+      - '.github/workflows/build-desktop.yml'
+  pull_request:
+    paths:
+      - 'desktop-app/**'
+      - '.github/workflows/build-desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+jobs:
+  # ── ۱) اعتبارسنجی سریع (بدون بسته‌بندی) ──────────────────────
+  check:
+    name: Config + protocol + cargo check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-app/src-tauri -> target
+          key: desktop-check
+
+      - name: Setup Python deps
+        shell: bash
+        run: python -m pip install --quiet --disable-pip-version-check cryptography
+
+      - name: Validate tauri.conf.json + icons + command parity
+        shell: bash
+        run: python desktop-app/tools/verify_config.py
+
+      - name: Validate protocol against deployed workers
+        shell: bash
+        run: python desktop-app/tools/protocol_parity.py
+
+      - name: Syntax-check the frontend
+        shell: bash
+        run: node --check desktop-app/src/main.js
+
+      - name: cargo check
+        run: cargo check --manifest-path desktop-app/src-tauri/Cargo.toml
+        continue-on-error: false
+
+  # ── ۲) ساخت ویندوز + آپلود به Releases ───────────────────────
+  build:
+    name: Windows installer
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-app/src-tauri -> target
+          key: desktop-release
+
+      # روی PR فقط ساخته می‌شود؛ روی main هم ساخته و هم منتشر می‌شود.
+      - name: Decide release target
+        id: target
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "mode=build-only" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "tag=desktop-v__VERSION__" >> "$GITHUB_OUTPUT"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "mode=build-only" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and publish on main)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop-app
+          tagName: ${{ steps.target.outputs.tag }}
+          releaseName: 'SCP-GHOST Desktop v__VERSION__'
+          releaseBody: |
+            نصب‌کنندهٔ ویندوز برنامهٔ SCP-GHOST.
+
+            **فایل‌ها**
+            - `*_x64-setup.exe` — نصب‌کنندهٔ NSIS (پیشنهادی، نصب برای کاربر جاری، بدون نیاز به دسترسی مدیر)
+            - `*_x64_en-US.msi` — بستهٔ MSI برای نصب سازمانی/Group Policy
+
+            **اجرا**
+            1. فایل `setup.exe` را دانلود و اجرا کنید.
+            2. اگر SmartScreen هشدار داد: More info → Run anyway (فایل امضای تجاری ندارد).
+            3. برنامه باز می‌شود → دکمهٔ «اتصال» → وضعیت باید «متصل و امن» شود.
+            4. دکمهٔ «اجرا» در بخش تست تونل، عبور ترافیک از تونل را تأیید می‌کند.
+
+            WebView2 در ویندوز ۱۰/۱۱ از پیش نصب است؛ در غیر این صورت نصب‌کننده خودش آن را دریافت می‌کند.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
+          retryAttempts: 2
+          args: --bundles nsis,msi
+
+      - name: Report mode
+        shell: bash
+        run: echo "build finished in '${{ steps.target.outputs.mode }}' mode"
+
+      - name: Upload installers as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scp-ghost-windows-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            desktop-app/src-tauri/target/release/bundle/nsis/*.exe
+            desktop-app/src-tauri/target/release/bundle/msi/*.msi
+            desktop-app/src-tauri/target/release/*.exe
