@@ -20,8 +20,16 @@ import * as rustModule from '../build/worker/shim.mjs';
 import { connect } from 'cloudflare:sockets';
 import { createVlessHandler, isVlessPath } from './vless.js';
 
-/** worker-build گاهی default می‌دهد و گاهی namespace — هر دو را بپذیر. */
-const rustWorker = rustModule.default && rustModule.default.fetch ? rustModule.default : rustModule;
+/**
+ * worker-build (بسته به نسخه) یا default صادر می‌کند یا named export.
+ * هر سه شکل را می‌پذیریم تا یک تغییر کوچک در shim، کل worker را 500 نکند.
+ */
+const SHAPES = [rustModule.default, rustModule];
+const hasFetch = (value) => Boolean(value) && typeof value.fetch === 'function';
+const rustWorker = SHAPES.find(hasFetch) || null;
+
+/** همان تابع fetch، برای فراخوانی مستقیم. */
+const rustFetch = rustWorker ? rustWorker.fetch.bind(rustWorker) : null;
 
 /**
  * کلاس Durable Object باید از **همین** entrypoint صادر شود.
@@ -31,7 +39,9 @@ const rustWorker = rustModule.default && rustModule.default.fetch ? rustModule.d
  * (`#[durable_object]`) تعریف شده و از shim صادر می‌شود؛ اینجا فقط
  * دوباره صادرش می‌کنیم.
  */
-export const SlidingWindowRateLimiter = rustModule.SlidingWindowRateLimiter;
+export const SlidingWindowRateLimiter =
+  rustModule.SlidingWindowRateLimiter ||
+  (rustModule.default && rustModule.default.SlidingWindowRateLimiter);
 
 /** یک handler ساخته‌شده برای هر env (کش‌شده روی env object). */
 const cache = new WeakMap();
@@ -56,10 +66,14 @@ export default {
       return handlerFor(env)(request);
     }
 
-    if (!rustWorker || typeof rustWorker.fetch !== 'function') {
-      return new Response('rust core unavailable', { status: 500 });
+    if (!rustFetch) {
+      // فقط در کارهای دیباگ دیده می‌شود؛ پیام عمداً گویاست.
+      return new Response(
+        'rust core unavailable: the wasm shim exposes no fetch() export',
+        { status: 500 },
+      );
     }
 
-    return rustWorker.fetch(request, env, ctx);
+    return rustFetch(request, env, ctx);
   },
 };

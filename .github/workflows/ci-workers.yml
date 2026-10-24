@@ -168,8 +168,12 @@ jobs:
           exit 0
 
       # ── canary: همان artifact روی رانتایم production ────────────
+      # توجه: این canary به یک quirk حساب برمی‌خورد (پس از Upload موفق،
+      # API با 10007 «Worker does not exist» جواب می‌دهد). گیتِ واقعی،
+      # health check سختِ بعد از deploy روی worker اصلی است.
       - name: Canary deploy on the production runtime
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        continue-on-error: true
         working-directory: streaming-worker
         run: |
           set -uo pipefail
