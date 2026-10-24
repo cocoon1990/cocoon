@@ -345,7 +345,7 @@ jobs:
               let path = req.path();
               if path == \"/health\" {
                   let v = env.var(\"WORKER_VERSION\").ok().map(|x| x.to_string()).unwrap_or_default();
-                  return Response::ok(format!(\"{{\\\"status\\\":\\\"ok\\\",\\\"version\\\":\\\"{}\\\",\\\"route\\\":\\\"manual\\\"}}\", v));
+                  return Response::ok(format!(\"{{\"status\":\"ok\",\"version\":\"{}\",\"route\":\"manual\"}}\", v));
               }
               Response::error(\"not implemented in probe\", 501)
           }"
