@@ -1,0 +1,113 @@
+# ══════════════════════════════════════════════════════════════
+#  Diagnostic — چرا entry ترکیبی روی Mainnet می‌میرد؟
+#
+#  واقعیت‌های اثبات‌شده تا اینجا:
+#    • wasm خالی (بدون کد WebSocket) با main = build/worker/shim.mjs → 200
+#    • همان wasm با main = src/entry.mjs (که shim را import می‌کند) → 1101
+#
+#  این ورک‌فلو همان **یک** build را چهار شکل روی worker اصلی (که الان
+#  هر حال خراب است) دیپلوی می‌کند و بعد از هر کدام probe می‌گیرد:
+#
+#    A) entry.mjs فعلی (wasm + cloudflare:sockets، با nodejs_compat)
+#    B) فقط shim.mjs                    ← کنترل (باید ۲۰۰ بدهد)
+#    C) entry.js-only  (بدون import از wasm، /health جعلی)
+#    D) entry.mjs بدون nodejs_compat
+#
+#  آخرین دیپلوی، نسخهٔ سالمِ کنترل است تا production دست‌کم برنگردد به
+#  حالت مرده. هیچ‌کدام از این‌ها روی main اجرا نمی‌شود.
+# ══════════════════════════════════════════════════════════════
+name: "🔎 Diagnostic — entry shape vs Mainnet"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["arena/ee9be859-cocoon"]
+    paths: [".github/workflows/diag-entry.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "A/B/C/D on the real worker"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      URL: https://ghost-streaming-worker.cocoon-de9.workers.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "streaming-worker -> target"
+          key: "diag"
+
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.7 --locked
+
+      - name: Build once
+        working-directory: streaming-worker
+        run: worker-build --release
+
+      - name: Probe every entry shape
+        working-directory: streaming-worker
+        run: |
+          set -uo pipefail
+          OUT=/tmp/res.txt; : > "$OUT"
+
+          # ── C: entry فقط-JS (هیچ import ای از wasm ندارد)
+          cat > src/entry-jsonly.mjs <<'EOF'
+          import { connect } from 'cloudflare:sockets';
+          import { createVlessHandler, isVlessPath } from './vless.js';
+          export default {
+            async fetch(request, env) {
+              const url = new URL(request.url);
+              if (isVlessPath(url.pathname, env && env.VLESS_PATH)) {
+                return createVlessHandler({ connect, env })(request);
+              }
+              return new Response('{"status":"ok","core":"js","version":"5.4.1"}', {
+                headers: { 'content-type': 'application/json' },
+              });
+            },
+          };
+          EOF
+
+          probe() { # $1=label  $2=main  $3=config-suffix (optional)
+            sed -e "s#^main .*#main = \"$2\"#" wrangler.toml > /tmp/w.toml
+            if [ "${3:-}" = "noflag" ]; then sed -i '/compatibility_flags/d' /tmp/w.toml; fi
+            set +e
+            npx --yes wrangler@latest deploy -c /tmp/w.toml > "/tmp/d-$1.log" 2>&1
+            RC=$?
+            set -e
+            sleep 12
+            CODE=000; BODY=""
+            for attempt in 1 2 3; do
+              CODE=$(curl -sS -o /tmp/b.txt -w '%{http_code}' --max-time 15 "$URL/health?cb=$GITHUB_RUN_ID-$1-$attempt" || echo 000)
+              BODY=$(head -c 120 /tmp/b.txt 2>/dev/null | tr '\n' ' ')
+              [ "$CODE" = "200" ] && break
+              sleep 8
+            done
+            printf '%s | deploy=%s | health=%s | %s\n' "$1" "$RC" "$CODE" "$BODY" >> "$OUT"
+          }
+
+          probe A-current-entry  src/entry.mjs
+          probe B-rust-shim-only build/worker/shim.mjs
+          probe C-js-only        src/entry-jsonly.mjs
+          probe D-no-nodejsflag  src/entry.mjs noflag
+
+          MSG=$(sed -e 's/%/%25/g' "$OUT" | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | head -c 900)
+          echo "::error title=entry-shapes::$MSG"
+
+          # آخرین دیپلوی را به کنترلِ سالم برگردان (تا worker از مرده‌بودن دربیاید)
+          sed -e 's#^main .*#main = "build/worker/shim.mjs"#' wrangler.toml > /tmp/w-final.toml
+          npx --yes wrangler@latest deploy -c /tmp/w-final.toml > /tmp/d-final.log 2>&1 || true
+          sleep 12
+          curl -sS -o /tmp/f.txt -w 'final health=%{http_code}\n' --max-time 15 "$URL/health?cb=$GITHUB_RUN_ID-final" || true
+          head -c 160 /tmp/f.txt || true
+
+          grep -aE 'ERROR|error:' /tmp/d-A-current-entry.log | head -3 || true
