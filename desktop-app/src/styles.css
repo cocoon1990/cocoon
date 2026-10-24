@@ -16,6 +16,7 @@
   --cyan-soft: rgba(6, 182, 212, 0.16);
   --emerald: #10b981;
   --emerald-soft: rgba(16, 185, 129, 0.16);
+  --mono: ui-monospace, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
   --danger: #f43f5e;
   --accent: var(--cyan);
   --accent-soft: var(--cyan-soft);
@@ -660,16 +661,59 @@ button.link:hover {
   color: var(--muted);
 }
 
+.log,
 #log {
+  display: block;
   margin: 0;
   padding: 10px 12px;
-  max-height: 168px;
+  max-height: 210px;
   overflow: auto;
+  font-family: var(--mono);
   font-size: 11px;
-  line-height: 1.6;
+  line-height: 1.7;
   color: #9fb3c8;
   white-space: pre-wrap;
   word-break: break-word;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.55);
+}
+
+.log .ln { display: block; }
+.log .ln.ok { color: #34d399; }
+.log .ln.err { color: #f87171; }
+
+.last-error {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.adapter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  background: rgba(16, 185, 129, 0.1);
+  color: #6ee7b7;
+  font-size: 11px;
+}
+
+.adapter-chip .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
 }
 
 #log:empty::before {

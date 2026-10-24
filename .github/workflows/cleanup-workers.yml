@@ -1,0 +1,72 @@
+# ══════════════════════════════════════════════════════════════
+#  Cleanup — حذف workerهای موقت دیباگ (یک‌بار برای همیشه)
+#
+#  در جریان پیدا کردن باگ 1101 (v5.4.0) ده‌ها worker موقت با نام‌های
+#  ghost-s1…، ghost-v1…، ghost-js-probe و … ساخته شد. این‌ها هیچ کاربرد
+#  تولیدی ندارند و فقط سهمیه و سطح حمله را زیاد می‌کنند.
+#
+#  فقط این دو worker زنده می‌مانند:
+#    • ghost-streaming-worker   — سرور VLESS + /sub + /stream
+#    • ghost-signaling-worker   — سیگنالینگ وب
+# ══════════════════════════════════════════════════════════════
+name: "🧹 Cleanup — temporary probe workers"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "arena/ee9be859-cocoon"]
+    paths: [".github/workflows/cleanup-workers.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup-workers
+  cancel-in-progress: false
+
+jobs:
+  purge:
+    name: "Delete everything except the two real workers"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+    steps:
+      - name: Guard — token present
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::CF_API_TOKEN is not configured"
+            exit 1
+          fi
+
+      - name: Delete known temporary workers
+        run: |
+          set -u
+          KEEP="ghost-streaming-worker ghost-signaling-worker"
+          TMP="ghost-js-probe ghost-rs-probe ghost-streaming-probe
+               ghost-streaming-canary ghost-streaming-nocompat
+               ghost-streaming-nobind ghost-streaming-kvonly
+               ghost-streaming-doonly ghost-streaming-olddate
+               ghost-v1-nod1 ghost-v2-minmain ghost-v3-router
+               ghost-v4-manual ghost-v5-realhandlers ghost-v6-profile
+               ghost-s1-stream ghost-s2-sub ghost-s3-vless"
+
+          DELETED=""
+          for name in $TMP; do
+            case " $KEEP " in *" $name "*) continue ;; esac
+            if npx --yes wrangler@latest delete --name "$name" --force >/tmp/del.log 2>&1; then
+              echo "✅ deleted $name"
+              DELETED="$DELETED $name"
+            else
+              echo "· $name — not found (already gone?)"
+            fi
+          done
+
+          echo "### deleted:$DELETED" >> "$GITHUB_STEP_SUMMARY"
+          echo "deleted:$DELETED"
+
+      - name: List what is left
+        run: |
+          set -u
+          npx --yes wrangler@latest deployments --name ghost-streaming-worker >/dev/null 2>&1 || true
+          echo "kept: ghost-streaming-worker, ghost-signaling-worker"

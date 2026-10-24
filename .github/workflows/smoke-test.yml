@@ -111,6 +111,21 @@ jobs:
             echo "✅ /sub exists and refuses to emit a link until VLESS params are configured"
           fi
 
+      # ── ۲ب. /vless — مسیر WebSocket زنده است؟ ───────────────
+      # از v5.4.1 سرور VLESS در entry.mjs است (نه wasm). یک GET ساده
+      # بدون Upgrade باید 426 بدهد؛ 1101/404 یعنی مسیر مرده است.
+      - name: "VLESS: GET /vless without upgrade → 426"
+        run: |
+          CODE=000
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o vless_body.txt -w '%{http_code}' --max-time 20 "$GHOST_BASE/vless" || echo 000)
+            [ "$CODE" = "426" ] && break
+            sleep 5
+          done
+          echo "status=$CODE"
+          [ "$CODE" = "426" ] || { echo "::error::/vless returned $CODE (expected 426 — WebSocket upgrade required)"; exit 1; }
+          echo "✅ /vless is served by the JS VLESS core and demands an upgrade"
+
       # ── ۳. /stream بدون پارامتر → 400 (نه 500) ─────────────
       - name: "Stream: missing params → 400"
         run: |
