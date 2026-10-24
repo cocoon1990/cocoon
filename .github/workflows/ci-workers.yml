@@ -170,13 +170,27 @@ jobs:
         working-directory: streaming-worker
         run: |
           set -uo pipefail
+
+          emit() { # $1=title  $2=message
+            printf '::error title=%s::%s\n' "$1" "$(printf '%s' "$2" | sed -e 's/%/%25/g' | awk 'BEGIN{ORS=""} {print (NR>1 ? "%0A" : "") $0}' | head -c 900)"
+          }
+          logtail() { tail -n 12 /tmp/canary.log 2>/dev/null | tr '\n' ' ' ; }
+
           sed -e '1s/.*/name = "ghost-streaming-canary"/' wrangler.toml > wrangler.canary.toml
+          echo "--- canary config ---"; head -6 wrangler.canary.toml
           trap 'npx --yes wrangler@latest delete --name ghost-streaming-canary --force >/dev/null 2>&1 || true' EXIT
 
-          npx --yes wrangler@latest deploy -c wrangler.canary.toml 2>&1 | tee /tmp/canary.log
+          if ! npx --yes wrangler@latest deploy -c wrangler.canary.toml > /tmp/canary.log 2>&1; then
+            emit "canary deploy" "wrangler deploy failed: $(logtail)"
+            exit 1
+          fi
+          tail -n 20 /tmp/canary.log
 
           HOST=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' /tmp/canary.log | head -1)
-          [ -n "$HOST" ] || { echo "::error title=canary::could not read the deployed URL"; exit 1; }
+          if [ -z "$HOST" ]; then
+            emit "canary url" "deploy succeeded but no workers.dev URL was printed: $(logtail)"
+            exit 1
+          fi
           echo "canary: $HOST"
 
           CODE=000
@@ -187,12 +201,16 @@ jobs:
             [ "$CODE" = "200" ] && break
           done
 
-          head -c 300 /tmp/canary.json || true
-          [ "$CODE" = "200" ] || { echo "::error title=canary /health::production runtime returned $CODE"; exit 1; }
-          grep -q '"worker":"ghost-streaming"' /tmp/canary.json || { echo "::error title=canary body::unexpected payload"; exit 1; }
+          BODY=$(head -c 200 /tmp/canary.json 2>/dev/null)
+          if [ "$CODE" != "200" ]; then
+            emit "canary /health" "production runtime returned $CODE — body: $BODY"
+            exit 1
+          fi
+          printf '%s' "$BODY" | grep -q '"worker":"ghost-streaming"' || { emit "canary body" "unexpected payload: $BODY"; exit 1; }
 
           VLESS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HOST/vless?cb=$GITHUB_RUN_ID" || echo 000)
           echo "canary /vless -> $VLESS"
-          [ "$VLESS" = "426" ] || [ "$VLESS" = "503" ] || { echo "::error title=canary /vless::got $VLESS"; exit 1; }
-
-          echo "queue_total=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$HOST/sub" || echo 000)" || true
+          case "$VLESS" in
+            426|503) echo "✅ canary is healthy: /health 200, /vless $VLESS" ;;
+            *) emit "canary /vless" "got $VLESS (expected 426)"; exit 1 ;;
+          esac
