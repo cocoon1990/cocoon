@@ -1,25 +1,20 @@
 name             = "ghost-streaming-worker"
 main             = "build/worker/shim.mjs"
 compatibility_date = "2025-10-01"
-compatibility_flags = ["nodejs_compat"]
+# compatibility_flags = ["nodejs_compat"]
+# ↑ عمداً خاموش است. هر buildی که با این فلگ روی Mainnet رفت 1101 داد،
+#   در حالی که همان wasm بدون فلگ (و بدون binding) ۲۰۰ برگرداند.
 
 [build]
 command = "worker-build --release"
 
-# ── Durable Objects ────────────────────────────────────────────
-[[durable_objects.bindings]]
-name       = "RATE_LIMITER"
-class_name = "SlidingWindowRateLimiter"
-
-# مهم: new_sqlite_classes برای فعال‌سازی SQLite API
-[[migrations]]
-tag               = "v1"
-new_sqlite_classes = ["SlidingWindowRateLimiter"]
-
-# ── KV Namespace (Config) ─────────────────────────────────────
-[[kv_namespaces]]
-binding = "GHOST_CONFIG"
-id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
+# ── Bindings ─────────────────────────────────────────────────
+# در v5.4.1 هیچ binding ای تعریف نمی‌شود: هر binding روی این worker با
+# 1101 روی Mainnet همراه بود. کد به‌صورت fail-open کار می‌کند:
+#   • rate limiter  → بدون RATE_LIMITER محدودیتی اعمال نمی‌شود (لاگ می‌زند)
+#   • /sub          → SUB_TOKEN و VLESS_UUID از secret خوانده می‌شوند
+#                     (read_setting: secret → var)
+# اگر بعداً binding لازم شد، اول روی یک worker آزمایشی تست کنید.
 
 # ── Secrets (inject شده توسط wrangler یا GitHub Actions) ─────
 # HMAC_SECRET — با `wrangler secret put HMAC_SECRET` تنظیم می‌شود
