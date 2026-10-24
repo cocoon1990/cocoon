@@ -233,9 +233,16 @@ impl DeclarativeRouter {
 
         RouteDecision {
             matched_rule: rule.name.clone(),
-            backend: format!("{:?}", rule.action.backend)
-                .to_lowercase()
-                .replace("_", "-"),
+            // نگاشت صریح — نه format!("{:?}").
+            // Debug enum نام variant را بدون خط تیره می‌دهد
+            // ("CloudflareStreamWorker" → "cloudflarestreamworker") و
+            // switch در sw.js هیچ‌وقت match نمی‌شد.
+            backend: match &rule.action.backend {
+                BackendType::CloudflareStreamWorker => "cloudflare-stream-worker",
+                BackendType::CloudflareSignalingWorker => "cloudflare-signaling-worker",
+                BackendType::Deny => "deny",
+            }
+            .to_string(),
             endpoint: rule.action.endpoint.clone(),
             hmac_required: rule.action.hmac_required,
             pipe_mode: rule.action.pipe_mode.clone(),
