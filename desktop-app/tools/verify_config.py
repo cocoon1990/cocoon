@@ -280,12 +280,18 @@ if f'version      = "{VERSION}"' not in worker_cargo and f'version = "{VERSION}"
     fail(f"streaming-worker/Cargo.toml must be {VERSION}")
 if f'WORKER_VERSION   = "{VERSION}"' not in worker_toml and f'WORKER_VERSION = "{VERSION}"' not in worker_toml:
     fail(f"wrangler WORKER_VERSION must be {VERSION}")
-if 'main             = "src/entry.mjs"' not in worker_toml and 'main = "src/entry.mjs"' not in worker_toml:
-    fail("wrangler main must be src/entry.mjs (JS entry + rust core)")
-if "createVlessHandler" not in worker_entry:
-    fail("entry.mjs does not route /vless to the VLESS core")
-if "cloudflare:sockets" not in worker_entry:
-    fail("entry.mjs does not import connect() from cloudflare:sockets")
+if 'main             = "build/worker/shim.mjs"' not in worker_toml and 'main = "build/worker/shim.mjs"' not in worker_toml:
+    fail("wrangler main must be build/worker/shim.mjs (the proven entry)")
+worker_vless_entry = read(WORKER / "src" / "vless-entry.mjs")
+worker_vless_toml = read(WORKER / "wrangler.vless.toml")
+if "createVlessHandler" not in worker_vless_entry:
+    fail("vless-entry.mjs does not route /vless to the VLESS core")
+if "cloudflare:sockets" not in worker_vless_entry:
+    fail("vless-entry.mjs does not import connect() from cloudflare:sockets")
+if re.search(r"shim\.mjs|build/worker|\.wasm", worker_vless_entry):
+    fail("the VLESS worker imports wasm — that is what caused 1101 on Mainnet")
+if '"ghost-vless-worker"' not in worker_vless_toml:
+    fail("wrangler.vless.toml must deploy the standalone VLESS worker")
 if "status: 101" not in worker_vless:
     fail("vless.js does not upgrade /vless to a WebSocket")
 if "WebSocketPair" in worker_rs or "from_websocket" in worker_rs:

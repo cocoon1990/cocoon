@@ -255,6 +255,20 @@ jobs:
           VLESS_UUID: ${{ steps.vless.outputs.uuid }}
           SUB_TOKEN: ${{ steps.vless.outputs.token }}
 
+      # ── Deploy the standalone JS VLESS worker ──────────────
+      # صفر wasm، صفر binding: فقط WebSocketPair + cloudflare:sockets.
+      # همان UUID مشتق‌شده تا کلید دو worker یکی باشد.
+      - name: Deploy the JS VLESS worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          command: deploy -c wrangler.vless.toml
+          workingDirectory: streaming-worker
+          secrets: |
+            VLESS_UUID
+        env:
+          VLESS_UUID: ${{ steps.vless.outputs.uuid }}
+
       # ── Health Check بعد از Deploy ─────────────────────────
       - name: Post-deploy health check
         env:
@@ -340,7 +354,9 @@ jobs:
             echo "::warning::CF_STREAMING_URL is not set. Skipping VLESS check."
             exit 0
           fi
-          URL="${HEALTH_URL%/}/vless"
+          # worker مستقل VLESS (نه worker اصلی)
+          SUBDOMAIN=$(python3 -c "import os,urllib.parse as u;h=u.urlparse(os.environ['HEALTH_URL']).hostname or '';print(h.split('.',1)[1] if '.' in h else '')")
+          URL="https://ghost-vless-worker.${SUBDOMAIN}/vless"
           CODE=000
           for attempt in 1 2 3; do
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$URL" || echo 000)

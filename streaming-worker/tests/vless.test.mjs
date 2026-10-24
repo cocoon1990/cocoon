@@ -464,15 +464,22 @@ test('pin: wasm دیگر کد WebSocket ندارد', () => {
 test('pin: /vless از wasm حذف شده است', () => {
   assert.equal(read('src', 'lib.rs').includes('"/vless", handle_vless'), false);
 });
-test('pin: entry.mjs هر دو موتور را می‌شناسد', () => {
-  const entry = read('src', 'entry.mjs');
-  assert.match(entry, /from '\.\.\/build\/worker\/shim\.mjs'/);
+test('pin: worker VLESS هیچ wasm ای import نمی‌کند', () => {
+  const entry = read('src', 'vless-entry.mjs');
   assert.match(entry, /from 'cloudflare:sockets'/);
   assert.match(entry, /createVlessHandler/);
-  assert.match(entry, /export const SlidingWindowRateLimiter/, 'the DO class must be exported by the entrypoint');
+  assert.doesNotMatch(entry, /shim\.mjs|build\/worker|\.wasm/, 'a wasm import is what triggers 1101 on Mainnet');
 });
-test('pin: wrangler به entry.mjs اشاره می‌کند', () => {
-  assert.match(read('wrangler.toml'), /main\s*=\s*"src\/entry\.mjs"/);
+test('pin: worker اصلی به shim راست برمی‌گردد (مسیر اثبات‌شده)', () => {
+  assert.match(read('wrangler.toml'), /main\s*=\s*"build\/worker\/shim\.mjs"/);
+});
+test('pin: کانفیگ worker VLESS مستقل است', () => {
+  const toml = read('wrangler.vless.toml');
+  assert.match(toml, /name\s*=\s*"ghost-vless-worker"/);
+  assert.match(toml, /main\s*=\s*"src\/vless-entry\.mjs"/);
+});
+test('pin: /sub به worker VLESS اشاره می‌کند', () => {
+  assert.match(read('wrangler.toml'), /VLESS_HOST\s*=\s*"ghost-vless-worker\./);
 });
 test('pin: /sub همچنان URI استاندارد می‌سازد', () => {
   assert.match(read('src', 'lib.rs'), /vless:\/\/\{\}@\{\}:443\?encryption=none&security=tls&sni=/);

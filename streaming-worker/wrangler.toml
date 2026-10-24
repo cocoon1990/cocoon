@@ -1,5 +1,5 @@
 name             = "ghost-streaming-worker"
-main             = "src/entry.mjs"
+main             = "build/worker/shim.mjs"
 compatibility_date = "2025-10-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -25,8 +25,11 @@ id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 # HMAC_SECRET — با `wrangler secret put HMAC_SECRET` تنظیم می‌شود
 #
 # ── VLESS Server (Cocoon in Cocoon) ───────────────────────────
-# از 5.4.0 این worker خودش سرور VLESS است (WS + cloudflare:sockets).
-# مسیر تونل: /vless ; اشتراک: /sub
+# از v5.4.1 سرور VLESS یک worker مستقل و **فقط-JS** است
+# (`ghost-vless-worker`، wrangler.vless.toml) چون هر ماژولی که کد
+# WebSocket را داخل wasm داشته باشد روی Mainnet با 1101 می‌میرد.
+# این worker فقط /health، /sub و /stream را سرو می‌کند و /sub لینکی
+# می‌سازد که به همان worker VLESS اشاره می‌کند.
 #
 #   wrangler secret put SUB_TOKEN     # >= 24 کاراکتر، تصادفی
 #   wrangler secret put VLESS_UUID    # UUID کلاینت = رمز تونل
@@ -43,6 +46,9 @@ id      = "e9277d0612d04fae97e8d0d7ac6dc87d"
 
 [vars]
 WORKER_VERSION   = "5.4.1"
+# میزبان worker VLESS که /sub باید در لینک اشتراک بنویسد.
+VLESS_HOST       = "ghost-vless-worker.cocoon-de9.workers.dev"
+VLESS_SNI        = "ghost-vless-worker.cocoon-de9.workers.dev"
 CONFIG_KV_KEY    = "routing_config"
 RATE_LIMIT_RPM   = "500"
 RATE_WINDOW_MS   = "60000"
