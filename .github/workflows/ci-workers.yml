@@ -331,10 +331,8 @@ jobs:
                   .get_async(\"/stream\", handle_stream)
                   .get_async(\"/vless\", handle_vless)
                   .get_async(\"/sub\", handle_subscription)
-                  .get(\"/health\", |_r, c| {
-                      let v = c.var(\"WORKER_VERSION\").map(|x| x.to_string()).unwrap_or_else(|_| \"unknown\".to_string());
-                      Response::ok(format!(\"{{\"status\":\"ok\",\"version\":\"{}\"}}\", v))
-                  });
+                  .get(\"/health\", |_r, c| Response::ok(
+                      c.var(\"WORKER_VERSION\").map(|x| x.to_string()).unwrap_or_else(|_| \"unknown\".to_string())));
               router.run(req, env).await
           }"
 
