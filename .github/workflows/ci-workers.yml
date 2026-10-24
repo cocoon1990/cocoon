@@ -199,42 +199,41 @@ jobs:
               print(f"::error title=workerd-run-{i}::{chunk}")
           PY
           exit 0
-      # ── آزمون قاطع: همین build را با wrangler@latest دیپلوی کن ──
-      # worker در Mainnet با 1101 می‌میرد ولی در workerd محلی ۲۰۰ می‌دهد.
-      # این گام مسیر دیپلوی (action در برابر CLI) را عوض می‌کند.
-      - name: Deploy same build with wrangler CLI, then probe
+      # ── آزمون قاطع: نسخهٔ 5.2.6 (last known good) را دیپلوی کن ──
+      # اگر همان کدِ قبلی هم 1101 بدهد، مشکل از دیف v5.4.0 نیست و
+      # پلتفرم/toolchain است. اگر ۲۰۰ بدهد، هم production برمی‌گردد و
+      # هم مقصر داخل دیف است.
+      - name: Deploy the last known good build (67d7009) and probe
         if: always()
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        working-directory: streaming-worker
         run: |
           set -uo pipefail
-          npx --yes wrangler@latest deploy > /tmp/deploy.log 2>&1
+          R=$(mktemp -d)
+          git worktree add --detach "$R/old" 67d7009231eb10b67ccc8fcf7648b770227d611e >/dev/null 2>&1
+          cd "$R/old/streaming-worker"
+          echo "old version: $(grep -m1 '^version' Cargo.toml)"
+          npx --yes wrangler@latest deploy > /tmp/old_deploy.log 2>&1
           echo "deploy rc=$?"
-          tail -n 8 /tmp/deploy.log > /tmp/probe2.txt
+          cp /tmp/old_deploy.log /tmp/probe3.txt
           sleep 15
           for i in 1 2 3 4 5 6; do
-            CODE=$(curl -sS -o /tmp/body2.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=pr-$GITHUB_RUN_ID-$i" || true)
-            echo "attempt $i -> $CODE" >> /tmp/probe2.txt
+            CODE=$(curl -sS -o /tmp/body3.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-worker.cocoon-de9.workers.dev/health?cb=old-$GITHUB_RUN_ID-$i" || true)
+            echo "old-build attempt $i -> $CODE" >> /tmp/probe3.txt
             [ "$CODE" = "200" ] && break
             sleep 10
           done
-          head -c 400 /tmp/body2.txt >> /tmp/probe2.txt 2>/dev/null || true
+          head -c 300 /tmp/body3.txt >> /tmp/probe3.txt 2>/dev/null || true
           python3 - <<'PY'
           import pathlib
-          report = pathlib.Path('/tmp/probe2.txt').read_text(errors='replace')
-          cur = ''
-          chunks = []
-          for line in report.splitlines():
-              if len(cur) + len(line) > 900:
-                  chunks.append(cur); cur = ''
-              cur += line + '%0A'
-          if cur: chunks.append(cur)
-          for i, chunk in enumerate(chunks[:6]):
-              print(f"::error title=cli-deploy-{i}::{chunk.replace('%', '%25').replace('%250A', '%0A')}")
+          report = pathlib.Path('/tmp/probe3.txt').read_text(errors='replace')
+          lines = [l for l in report.splitlines() if l.strip()]
+          text = '%0A'.join(l.replace('%', '%25')[:300] for l in lines[-12:])
+          print(f"::error title=old-build::{text}")
           PY
           exit 0
+
       # ── گرفتن استثنای واقعی با wrangler tail ────────────────────
       # health فقط «1101» می‌دهد؛ متن استثنا تنها از طریق tail می‌آید.
       - name: Capture the live exception with wrangler tail
