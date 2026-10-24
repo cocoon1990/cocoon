@@ -228,3 +228,61 @@ jobs:
           done
           head -c 200 /tmp/b.txt >> "$OUT" 2>/dev/null || true
           exit 0
+
+      # ══ پروب ماتریسی: محیط سالم است یا artifact؟ ═════════════════
+      # ۱) یک worker خالص JS: اگر این هم 1101 بدهد → مشکل حساب/لبه است.
+      - name: Probe A — minimal JS worker (environment sanity)
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          mkdir -p /tmp/jsprobe && cd /tmp/jsprobe
+          printf 'export default { async fetch() { return new Response("js-ok"); } };\n' > probe.mjs
+          printf 'name = "ghost-js-probe"\nmain = "probe.mjs"\ncompatibility_date = "2025-10-01"\nworkers_dev = true\n' > wrangler.toml
+          npx --yes wrangler@latest deploy > deploy.log 2>&1
+          echo "deploy rc=$?" >> deploy.log
+          sleep 25
+          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 15 "https://ghost-js-probe.cocoon-de9.workers.dev/?cb=$GITHUB_RUN_ID" || true)
+          MSG="A js-probe -> HTTP $CODE | body=$(head -c 80 body.txt | tr '\n' ' ')%0Adeploy: $(tail -n 4 deploy.log | tr '\n' ' ' | cut -c1-260)"
+          echo "::error title=probe-A-js::$MSG"
+
+      # ۲) مینیمال‌ترین worker ممکن با همان toolchain راست (همان worker 0.8.7).
+      #    اگر این سالم باشد، کد برنامه مقصر است، نه ابزار.
+      - name: Probe B — minimal Rust worker (same toolchain)
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          mkdir -p /tmp/rsprobe/src && cd /tmp/rsprobe
+          printf '[package]\nname = "rsprobe"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\nworker = { version = "0.8.7" }\n\n[profile.release]\nopt-level = "z"\nlto = "fat"\ncodegen-units = 1\npanic = "abort"\n' > Cargo.toml
+          printf 'use worker::*;\n\n#[event(fetch)]\npub async fn main(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n    Response::ok("rs-ok")\n}\n' > src/lib.rs
+          printf 'name = "ghost-rs-probe"\nmain = "build/worker/shim.mjs"\ncompatibility_date = "2025-10-01"\n\n[build]\ncommand = "worker-build --release"\n' > wrangler.toml
+          worker-build --release > build.log 2>&1
+          echo "build rc=$? size=$(wc -c < build/worker/shim.wasm 2>/dev/null || echo 0)" >> build.log
+          npx --yes wrangler@latest deploy >> build.log 2>&1
+          echo "deploy rc=$?" >> build.log
+          sleep 25
+          CODE=$(curl -sS -o body.txt -w '%{http_code}' --max-time 15 "https://ghost-rs-probe.cocoon-de9.workers.dev/?cb=$GITHUB_RUN_ID" || true)
+          MSG="B rs-probe -> HTTP $CODE | body=$(head -c 80 body.txt | tr '\n' ' ')%0A$(grep -E 'build rc|deploy rc|error' build.log | tail -n 3 | tr '\n' ' ' | cut -c1-240)"
+          echo "::error title=probe-B-rust::$MSG"
+
+      # ۳) همان build فعلی، ولی بدون nodejs_compat → ایزوله کردن کامپَت‌فلگ‌ها.
+      - name: Probe C — same build without nodejs_compat
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          set -u
+          cd streaming-worker
+          sed -e '1s/.*/name = "ghost-streaming-nocompat"/' -e '/compatibility_flags/d' wrangler.toml > wrangler.nocompat.toml
+          npx --yes wrangler@latest deploy -c wrangler.nocompat.toml > /tmp/nc.log 2>&1
+          echo "deploy rc=$?" >> /tmp/nc.log
+          sleep 25
+          CODE=$(curl -sS -o /tmp/ncb.txt -w '%{http_code}' --max-time 15 "https://ghost-streaming-nocompat.cocoon-de9.workers.dev/health?cb=$GITHUB_RUN_ID" || true)
+          MSG="C no-compat -> HTTP $CODE | body=$(head -c 80 /tmp/ncb.txt | tr '\n' ' ')%0A$(tail -n 3 /tmp/nc.log | tr '\n' ' ' | cut -c1-240)"
+          echo "::error title=probe-C-nocompat::$MSG"
