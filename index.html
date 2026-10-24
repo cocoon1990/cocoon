@@ -1,0 +1,1304 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SCP-GHOST — Phantom Citadel</title>
+
+  <!--
+    docs/index.html — SCP-GHOST v5.2.6 UI
+    این صفحه:
+      ۱. Service Worker را ثبت می‌کند
+      ۲. Session keys را از Signaling Worker می‌خواند
+      ۳. PhantomSession را در Service Worker init می‌کند
+      ۴. وضعیت اتصال را نمایش می‌دهد
+  -->
+
+  <style>
+    /* ── CSS Variables ───────────────────────────────────── */
+    :root {
+      --bg-primary:    #0d1117;
+      --bg-secondary:  #161b22;
+      --bg-card:       #1c2128;
+      --border:        #30363d;
+      --text-primary:  #e6edf3;
+      --text-secondary:#8b949e;
+      --text-muted:    #6e7681;
+      --accent-green:  #3fb950;
+      --accent-blue:   #58a6ff;
+      --accent-yellow: #d29922;
+      --accent-red:    #f85149;
+      --accent-purple: #bc8cff;
+      --font-mono:     "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+      --font-ui:       "Vazirmatn", "Segoe UI", system-ui, sans-serif;
+      --radius:        8px;
+      --transition:    0.2s ease;
+    }
+
+    /* ── Reset ────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Base ─────────────────────────────────────────────── */
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: var(--font-ui);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+      line-height: 1.6;
+    }
+
+    /* ── Layout ───────────────────────────────────────────── */
+    .container {
+      width: 100%;
+      max-width: 720px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
+    /* ── Header ───────────────────────────────────────────── */
+    .header {
+      text-align: center;
+      padding: 2rem 0 1rem;
+    }
+
+    .header__logo {
+      font-size: 2.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -0.5px;
+      font-family: var(--font-mono);
+    }
+
+    .header__subtitle {
+      color: var(--text-secondary);
+      font-size: 0.875rem;
+      margin-top: 0.5rem;
+      font-family: var(--font-mono);
+    }
+
+    .header__version {
+      display: inline-block;
+      margin-top: 0.75rem;
+      padding: 0.2rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    /* ── Card ─────────────────────────────────────────────── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      transition: border-color var(--transition);
+    }
+
+    .card:hover { border-color: #484f58; }
+
+    .card__title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+      font-family: var(--font-mono);
+    }
+
+    /* ── Status Indicator ─────────────────────────────────── */
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 500px) { .status-grid { grid-template-columns: 1fr; } }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+      padding: 0.625rem 0.875rem;
+      background: var(--bg-secondary);
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--text-muted);
+      transition: background var(--transition);
+    }
+
+    .status-dot--ok      { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+    .status-dot--warn    { background: var(--accent-yellow); box-shadow: 0 0 6px var(--accent-yellow); }
+    .status-dot--error   { background: var(--accent-red);   box-shadow: 0 0 6px var(--accent-red); }
+    .status-dot--loading { animation: pulse 1.2s ease-in-out infinite; background: var(--accent-blue); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    .status-text { font-size: 0.8rem; color: var(--text-secondary); }
+    .status-text strong { color: var(--text-primary); font-weight: 500; }
+
+    /* ── Big Status Banner ────────────────────────────────── */
+    .connection-banner {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      padding: 1.5rem;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      transition: all var(--transition);
+    }
+
+    .connection-banner__icon { font-size: 2rem; }
+
+    .connection-banner__text {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .connection-banner__label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .connection-banner__value {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .connection-banner--connected {
+      border-color: var(--accent-green);
+      background: rgba(63, 185, 80, 0.06);
+    }
+
+    .connection-banner--error {
+      border-color: var(--accent-red);
+      background: rgba(248, 81, 73, 0.06);
+    }
+
+    /* ── Log Output ───────────────────────────────────────── */
+    .log-output {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      line-height: 1.7;
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) - 2px);
+      padding: 0.875rem 1rem;
+      max-height: 200px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .log-output:empty::before {
+      content: "در انتظار رویدادها...";
+      color: var(--text-muted);
+    }
+
+    .log-line { display: block; }
+    .log-line--ok     { color: var(--accent-green); }
+    .log-line--warn   { color: var(--accent-yellow); }
+    .log-line--error  { color: var(--accent-red); }
+    .log-line--info   { color: var(--accent-blue); }
+    .log-line--muted  { color: var(--text-muted); }
+
+    /* ── Metrics ──────────────────────────────────────────── */
+    .metrics-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 400px) { .metrics-row { grid-template-columns: 1fr; } }
+
+    .metric {
+      text-align: center;
+      padding: 0.875rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) - 2px);
+    }
+
+    .metric__value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--accent-blue);
+      font-family: var(--font-mono);
+    }
+
+    .metric__label {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+
+    /* ── Buttons ──────────────────────────────────────────── */
+    .btn-row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 0.5rem 1.125rem;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      font-size: 0.8rem;
+      font-family: var(--font-ui);
+      cursor: pointer;
+      transition: all var(--transition);
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .btn:hover { background: var(--bg-card); border-color: #484f58; }
+    .btn:active { transform: scale(0.98); }
+
+    .btn--primary {
+      background: var(--accent-blue);
+      border-color: var(--accent-blue);
+      color: #0d1117;
+      font-weight: 600;
+    }
+
+    .btn--primary:hover { filter: brightness(1.1); }
+    .btn--danger { border-color: var(--accent-red); color: var(--accent-red); }
+    .btn--danger:hover { background: rgba(248,81,73,0.1); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Tunnel Test ──────────────────────────────────────── */
+    .tunnel-test__row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: stretch;
+    }
+
+    .input {
+      flex: 1 1 260px;
+      min-width: 0;
+      padding: 0.5rem 0.75rem;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      font-size: 0.8rem;
+      font-family: var(--font-mono);
+      transition: border-color var(--transition);
+    }
+
+    .input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    .tunnel-test__meta {
+      margin-top: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      word-break: break-word;
+    }
+
+    .tunnel-test__out {
+      margin-top: 0.75rem;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      line-height: 1.6;
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) - 2px);
+      padding: 0.875rem 1rem;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      direction: ltr;
+      text-align: left;
+    }
+
+    /* ── Footer ───────────────────────────────────────────── */
+    .footer {
+      text-align: center;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      padding: 2rem 0 1rem;
+      font-family: var(--font-mono);
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- ── Header ─────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header__logo">SCP-GHOST</div>
+    <div class="header__subtitle">Operation Phantom Citadel — v5.2.6</div>
+    <span class="header__version" id="sw-version">SW: loading...</span>
+  </header>
+
+  <!-- ── Connection Banner ──────────────────────────────── -->
+  <div class="connection-banner" id="connection-banner">
+    <div class="connection-banner__icon" id="banner-icon">⏳</div>
+    <div class="connection-banner__text">
+      <span class="connection-banner__label">وضعیت اتصال</span>
+      <span class="connection-banner__value" id="banner-value">در حال راه‌اندازی...</span>
+    </div>
+  </div>
+
+  <!-- ── Component Status ───────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">وضعیت اجزا</div>
+    <div class="status-grid">
+      <div class="status-item">
+        <span class="status-dot status-dot--loading" id="dot-sw"></span>
+        <div class="status-text">
+          <strong>Service Worker</strong>
+
+          <span id="label-sw">در حال بارگذاری...</span>
+        </div>
+      </div>
+      <div class="status-item">
+        <span class="status-dot status-dot--loading" id="dot-wasm"></span>
+        <div class="status-text">
+          <strong>Wasm Router</strong>
+
+          <span id="label-wasm">منتظر SW...</span>
+        </div>
+      </div>
+      <div class="status-item">
+        <span class="status-dot" id="dot-session"></span>
+        <div class="status-text">
+          <strong>PhantomSession</strong>
+
+          <span id="label-session">ایجاد نشده</span>
+        </div>
+      </div>
+      <div class="status-item">
+        <span class="status-dot" id="dot-backend"></span>
+        <div class="status-text">
+          <strong>Backend</strong>
+
+          <span id="label-backend">ناشناخته</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Metrics ────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">آمار Session</div>
+    <div class="metrics-row">
+      <div class="metric">
+        <div class="metric__value" id="metric-requests">—</div>
+        <div class="metric__label">درخواست‌ها</div>
+      </div>
+      <div class="metric">
+        <div class="metric__value" id="metric-endpoints">—</div>
+        <div class="metric__label">مسیر ترافیک</div>
+      </div>
+      <div class="metric">
+        <div class="metric__value" id="metric-config-ver">—</div>
+        <div class="metric__label">Config Version</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Actions ────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">عملیات</div>
+    <div class="btn-row">
+      <button class="btn btn--primary" id="btn-connect" onclick="connectSession()" disabled>
+        🔗 اتصال و Init Session
+      </button>
+      <button class="btn" id="btn-refresh" onclick="refreshStatus()">
+        🔄 بروزرسانی وضعیت
+      </button>
+      <button class="btn btn--danger" id="btn-destroy" onclick="destroySession()" disabled>
+        🗑️ Destroy Session
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Event Log ──────────────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">Event Log</div>
+    <div class="log-output" id="event-log"></div>
+  </div>
+
+  <!-- ── Test Tunnel ────────────────────────────────────── -->
+  <div class="card">
+    <div class="card__title">تست تونل</div>
+
+    <div class="tunnel-test__row">
+      <input
+        class="input"
+        id="tunnel-test-url"
+        type="url"
+        dir="ltr"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="Tunnel test URL"
+        value="https://www.youtube.com/robots.txt"
+      />
+      <button class="btn btn--primary" id="btn-tunnel-test" onclick="runTunnelTest()">
+        🧪 Fetch via Tunnel
+      </button>
+    </div>
+
+    <div class="tunnel-test__meta" id="tunnel-test-meta">
+      آماده — مقصد باید در allowlist باشد (YouTube / Google CDN).
+    </div>
+
+    <pre class="tunnel-test__out" id="tunnel-test-output" dir="ltr">—</pre>
+  </div>
+
+</div><!-- /container -->
+
+<!-- ── Footer ───────────────────────────────────────────── -->
+<footer class="footer">
+  SCP-GHOST v5.2.6 · Phantom Citadel · کد متن‌باز، بدون سرور شخص ثالث
+</footer>
+
+<script type="module">
+// ══════════════════════════════════════════════════════════════
+//  index.html — Main Thread Script
+//  وظایف:
+//    ۱. ثبت Service Worker
+//    ۲. دریافت session keys از Signaling Worker
+//    ۳. ارسال INIT_SESSION به Service Worker
+//    ۴. نمایش وضعیت در UI
+//    ۵. ارسال DESTROY در beforeunload
+// ══════════════════════════════════════════════════════════════
+
+// این مقدار توسط deploy-pages.yml inject می‌شود
+const SIGNALING_URL = "https://ghost-signaling-worker.cocoon-de9.workers.dev";
+const SW_VERSION    = "5.2.6";
+
+let swRegistration  = null;
+let configVersion   = "—";
+let wasmReady       = false;  // Wasm ماژول در Service Worker لود و آماده است؟
+
+const WASM_LOAD_TIMEOUT_MS = 5000;
+const WASM_LOAD_ERROR      = "Wasm failed to load. Please refresh.";
+let wasmLoadTimeout        = null;
+let wasmFailureReported    = false;
+let wasmFailureReasonLogged = null;
+
+// ── DOM References ─────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const logEl = $("event-log");
+
+// ── Logging ────────────────────────────────────────────────
+function log(message, type = "info") {
+  const now = new Date().toLocaleTimeString("fa-IR");
+  const line = document.createElement("span");
+  line.className = `log-line log-line--${type}`;
+  line.textContent = `[${now}] ${message}`;
+  logEl.appendChild(line);
+  logEl.appendChild(document.createElement("br"));
+  logEl.scrollTop = logEl.scrollHeight;
+
+  const prefix = { ok: "✅", warn: "⚠️", error: "❌", info: "ℹ️", muted: "·" };
+  console.log(`${prefix[type] || "·"} [Ghost] ${message}`);
+}
+
+// ── Dot Status Update ──────────────────────────────────────
+function setDot(id, state, label) {
+  const dot = $(`dot-${id}`);
+  const lbl = $(`label-${id}`);
+  if (dot) {
+    dot.className = `status-dot status-dot--${state}`;
+  }
+  if (lbl && label) lbl.textContent = label;
+}
+
+// ── Banner Update ──────────────────────────────────────────
+function setBanner(icon, text, type) {
+  $("banner-icon").textContent = icon;
+  $("banner-value").textContent = text;
+  const banner = $("connection-banner");
+  banner.className = `connection-banner${type ? ` connection-banner--${type}` : ""}`;
+}
+
+// دکمه اتصال فقط وقتی فعال می‌شود که SW کنترل را گرفته و Wasm لود شده باشد.
+function updateConnectButton() {
+  const btn = $("btn-connect");
+  if (!btn) return;
+
+  const swActive = Boolean(
+    swRegistration?.active ||
+    ("serviceWorker" in navigator && navigator.serviceWorker.controller)
+  );
+  btn.disabled = !wasmReady || !swActive;
+}
+
+function markWasmReady(label = "Wasm آماده") {
+  if (wasmLoadTimeout) {
+    clearTimeout(wasmLoadTimeout);
+    wasmLoadTimeout = null;
+  }
+
+  const firstReady = !wasmReady;
+  wasmReady = true;
+  wasmFailureReported = false;
+  wasmFailureReasonLogged = null;
+  setDot("wasm", "ok", label);
+  if (firstReady) {
+    log("Wasm ماژول در Service Worker لود شد.", "ok");
+  }
+  updateConnectButton();
+}
+
+function reportWasmFailure(reason = "") {
+  if (wasmLoadTimeout) {
+    clearTimeout(wasmLoadTimeout);
+    wasmLoadTimeout = null;
+  }
+
+  wasmReady = false;
+  if (!wasmFailureReported) {
+    // پیام دقیق failsafe — حتی اگر activation یا GET_STATUS هرگز resolve نشود.
+    log(WASM_LOAD_ERROR, "error");
+    wasmFailureReported = true;
+  }
+
+  // جزئیات فنی SW را هم نشان میدهیم تا خطای واقعی import/init پنهان نماند.
+  if (reason && reason !== wasmFailureReasonLogged) {
+    log(`جزئیات فنی: ${reason}`, "muted");
+    wasmFailureReasonLogged = reason;
+  }
+
+  setDot("wasm", "error", "Wasm خطا");
+  setBanner("❌", "Wasm لود نشد", "error");
+  updateConnectButton();
+}
+
+function armWasmLoadFailSafe() {
+  if (wasmLoadTimeout) clearTimeout(wasmLoadTimeout);
+  wasmFailureReported = false;
+  wasmFailureReasonLogged = null;
+
+  // تایمر قبل از register/waitForActive آغاز می‌شود تا awaitهای بالقوهٔ hung
+  // نتوانند fail-safe را به تأخیر بیندازند.
+  wasmLoadTimeout = setTimeout(() => {
+    wasmLoadTimeout = null;
+    if (!wasmReady) reportWasmFailure();
+  }, WASM_LOAD_TIMEOUT_MS);
+}
+
+// GET_STATUS همیشه جواب ندارد (SW ممکن است در حال restart باشد). پس timeout دارد.
+function requestServiceWorkerStatus(sw, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    if (!sw) {
+      resolve(null);
+      return;
+    }
+
+    const channel = new MessageChannel();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    channel.port1.onmessage = (event) => finish(event.data);
+
+    try {
+      sw.postMessage({ type: "GET_STATUS" }, [channel.port2]);
+    } catch (err) {
+      console.error("[Ghost] GET_STATUS failed:", err);
+      finish(null);
+    }
+  });
+}
+
+if ("serviceWorker" in navigator) {
+  // ممکن است claim بعد از WASM_READY اعمال شود؛ دکمه همان موقع آزاد شود.
+  navigator.serviceWorker.addEventListener("controllerchange", updateConnectButton);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  STEP 1: ثبت Service Worker
+// ──────────────────────────────────────────────────────────────
+async function registerGhostServiceWorker() {
+  // sw.js اکنون import ایستا دارد؛ بنابراین حتماً باید بهصورت Module SW ثبت شود.
+  // fallback به classic SW باعث SyntaxError و پنهان شدن علت واقعی میشود.
+  return navigator.serviceWorker.register("./sw.js", {
+    type: "module",
+    scope: "./",
+    updateViaCache: "none",
+  });
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) {
+    log("مرورگر شما از Service Worker پشتیبانی نمیکند.", "error");
+    setDot("sw", "error", "پشتیبانی نمیشود");
+    setBanner("❌", "مرورگر ناسازگار", "error");
+    reportWasmFailure("Service Worker is not supported by this browser.");
+    return;
+  }
+
+  // تایمر fail-safe در زمان اجرای اسکریپت و قبل از register/wait/GET_STATUS
+  // شروع شده است تا await طولانی یا بیپاسخ نتواند آن را به تأخیر بیندازد.
+  try {
+    log("در حال ثبت Service Worker...", "info");
+    swRegistration = await registerGhostServiceWorker();
+
+    log("Service Worker ثبت شد. در انتظار فعالسازی...", "info");
+    setDot("sw", "warn", "در انتظار فعالسازی");
+
+    // این await حداکثر ۴ ثانیه منتظر میماند؛ fail-safe مستقل همچنان فعال است.
+    await waitForActiveServiceWorker(swRegistration);
+
+    const sw = swRegistration.active || navigator.serviceWorker.controller;
+    if (sw) {
+      log("Service Worker فعال است.", "ok");
+      setDot("sw", "ok", "فعال");
+    } else {
+      log("Service Worker هنوز کنترل صفحه را نگرفته است.", "warn");
+      setDot("sw", "warn", "در انتظار کنترل");
+    }
+    $("sw-version").textContent = `SW: v${SW_VERSION}`;
+    updateConnectButton();
+
+    // اگر broadcast زودتر از listener رسیده باشد، وضعیت را مستقیماً میخوانیم.
+    const status = await requestServiceWorkerStatus(sw, 1500);
+    if (status?.version) {
+      $("sw-version").textContent = `SW: v${status.version}`;
+    }
+    if (status?.wasmLoaded || status?.wasmReady) {
+      markWasmReady();
+    } else if (sw && !wasmReady) {
+      // PING هم init احتمالی را تکمیل میکند و هم WASM_READY را دوباره میفرستد.
+      sw.postMessage({ type: "PING" });
+    }
+
+  } catch (err) {
+    console.error("[Ghost] Service Worker registration failed:", err);
+    log(`خطا در ثبت Service Worker: ${err.message}`, "error");
+    setDot("sw", "error", "خطا");
+    setBanner("❌", "Service Worker خطا", "error");
+    reportWasmFailure(err?.message || String(err));
+  }
+}
+
+function waitForActiveServiceWorker(registration, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    if (registration.active) {
+      resolve();
+      return;
+    }
+
+    const sw = registration.installing || registration.waiting;
+    if (!sw) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      updateConnectButton();
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      log("فعالسازی Service Worker بیش از حد طول کشید؛ بررسی ادامه مییابد.", "warn");
+      finish();
+    }, timeoutMs);
+
+    sw.addEventListener("statechange", () => {
+      updateConnectButton();
+      if (sw.state === "activated" || sw.state === "redundant") {
+        finish();
+      }
+    });
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+//  STEP 2: تبادل کلید X25519 با Signaling Worker
+//
+//  هیچ secret خامی روی سیم نمی‌رود:
+//    ۱. keypair موقت X25519 در Wasm ساخته می‌شود (کلید خصوصی
+//       هرگز از مرورگر خارج نمی‌شود)
+//    ۲. فقط کلید عمومی به /session-init می‌رود
+//    ۳. worker با X25519+HKDF یک KEK می‌سازد و کلیدهای اصلی را
+//       با AES-256-GCM زیر آن رمز می‌کند
+//    ۴. همین‌جا در Wasm باز می‌شود
+// ──────────────────────────────────────────────────────────────
+
+let wasmModule = null;
+
+async function loadWasm() {
+  if (wasmModule) return wasmModule;
+  const mod = await import("./wasm/ghost_wasm.js?v=5.2.6");
+  // باینری هم نسخه‌دار لود می‌شود؛ وگرنه کش قدیمی .wasm نگاشت قدیمی
+  // backend را برمی‌گرداند.
+  await mod.default({
+    module_or_path: new URL(`./wasm/ghost_wasm_bg.wasm?v=${SW_VERSION}`, import.meta.url),
+  });
+  wasmModule = mod;
+  return mod;
+}
+
+/**
+ * ساخت پیام خطای گویا از پاسخ HTTP.
+ * — JSON → فیلد message یا error
+ * — HTML (صفحهٔ خطای Cloudflare) → <title> یا متن خالص‌شده
+ * — بقیه → متن خام
+ * — خروجی حداکثر ۲۰۰ کاراکتر، همراه با URL دقیق
+ */
+async function describeHttpFailure(resp, url, method = "POST") {
+  let raw = "";
+  try {
+    raw = (await resp.text()) || "";
+  } catch (_) {
+    raw = "";
+  }
+
+  const trimmed = raw.trim();
+  let detail = "";
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    // JSON — دقیق‌ترین منبع
+    try {
+      const parsed = JSON.parse(trimmed);
+      detail =
+        parsed.message ||
+        parsed.error ||
+        parsed.detail ||
+        trimmed;
+    } catch (_) {
+      detail = trimmed;
+    }
+  } else if (trimmed.startsWith("<")) {
+    // HTML — معمولاً صفحهٔ خطای Cloudflare (مثلاً 405 Method Not Allowed)
+    const titleMatch = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    detail = titleMatch
+      ? `HTML: ${titleMatch[1].trim()}`
+      : `HTML: ${trimmed.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()}`;
+  } else {
+    detail = trimmed;
+  }
+
+  // ۲۰۰ کاراکتر اول — جلوگیری از پر شدن UI
+  detail = String(detail || "").replace(/\s+/g, " ").trim().slice(0, 200);
+
+  const statusLine = `HTTP ${resp.status}${resp.statusText ? " " + resp.statusText : ""}`;
+  const endpoint = `${method} ${url}`;
+
+  return detail ? `${statusLine} — ${endpoint} — ${detail}` : `${statusLine} — ${endpoint}`;
+}
+
+async function fetchSessionKeys() {
+  const sessionUrl = `${SIGNALING_URL}/session-init`;
+
+  try {
+    log("تبادل کلید X25519 با Signaling Worker...", "info");
+    // URL دقیق همیشه لاگ می‌شود — حتی اگر درخواست به شبکه نرسد
+    log(`POST ${sessionUrl}`, "muted");
+
+    // ۱. keypair موقت در Wasm
+    const wasm = await loadWasm();
+    const handshake = new wasm.SessionHandshake();
+
+    // ۲. ارسال فقط کلید عمومی
+    //    (Content-Type: application/json → مرورگر اول OPTIONS می‌فرستد؛
+    //     worker حالا preflight را سراسری و قبل از Router جواب می‌دهد)
+    let resp;
+    try {
+      resp = await fetch(sessionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_pubkey: handshake.public_key_b64(),
+          client_version: SW_VERSION,
+        }),
+      });
+    } catch (netErr) {
+      // خطای شبکه/CORS — مرورگر جزئیات را پنهان می‌کند
+      throw new Error(
+        `شبکه/CORS: ${netErr.message} — POST ${sessionUrl} ` +
+        `(اگر preflight رد شده باشد، این خطا معمولاً "Failed to fetch" است)`
+      );
+    }
+
+    if (!resp.ok) {
+      const detail = await describeHttpFailure(resp, sessionUrl, "POST");
+
+      if (resp.status === 429) {
+        throw new Error(`محدودیت نرخ درخواست — ${detail}`);
+      }
+      if (resp.status === 405) {
+        throw new Error(
+          `${detail} — احتمالاً preflight توسط لبه رد شده است؛ ` +
+          `origin فعلی: ${location.origin}`
+        );
+      }
+      throw new Error(detail);
+    }
+
+    const data = await resp.json();
+
+    if (!data.server_pubkey || !data.salt || !data.wrapped) {
+      throw new Error("پاسخ ناقص از Signaling Worker: فیلدهای handshake یافت نشد.");
+    }
+    if (data.protocol && data.protocol !== "x25519-hkdf-sha256-aesgcm-v1") {
+      throw new Error(`پروتکل ناشناخته: ${data.protocol}`);
+    }
+
+    // ۳. باز کردن payload رمزشده در Wasm
+    const keys = JSON.parse(
+      handshake.complete(data.server_pubkey, data.salt, data.wrapped)
+    );
+
+    log(`Config version: ${data.config_version || "نامشخص"}`, "muted");
+    configVersion = data.config_version || "—";
+    $("metric-config-ver").textContent = configVersion;
+
+    return {
+      hmacKeyHex:      keys.hmac_key_hex,
+      aesKeyHex:       keys.aes_key_hex,
+      gasEndpointsJson: JSON.stringify(data.gas_endpoints || []),
+    };
+
+  } catch (err) {
+    log(`خطا در تبادل کلید (origin=${location.origin}): ${err.message}`, "error");
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  STEP 3: ارسال INIT_SESSION به Service Worker
+// ──────────────────────────────────────────────────────────────
+async function sendInitSession(keys) {
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
+
+    channel.port1.onmessage = (event) => {
+      if (event.data.success) {
+        resolve();
+      } else {
+        reject(new Error(event.data.error || "Session init failed in SW"));
+      }
+    };
+
+    const sw = swRegistration?.active;
+    if (!sw) {
+      reject(new Error("Service Worker فعال نیست"));
+      return;
+    }
+
+    sw.postMessage(
+      { type: "INIT_SESSION", payload: keys },
+      [channel.port2]
+    );
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Public: اتصال کامل
+// ──────────────────────────────────────────────────────────────
+window.connectSession = async function () {
+  $("btn-connect").disabled = true;
+  setBanner("⏳", "در حال اتصال...", "");
+  if (!wasmReady && !wasmLoadTimeout && !wasmFailureReported) armWasmLoadFailSafe();
+
+  try {
+    // Keys دریافت و Session ساخته می‌شود
+    const keys = await fetchSessionKeys();
+
+    // Race-fix: INIT_SESSION حتماً بعد از WASM_READY / GHOST_READY ارسال شود.
+    // دکمه Connect تا آن‌جا غیرفعال است، اما برای امنیت بیشتر دوباره چک می‌کنیم.
+    if (!wasmReady) {
+      log("در انتظار آمادگی Wasm در Service Worker...", "info");
+      const sw = swRegistration?.active || navigator.serviceWorker.controller;
+      if (!sw) {
+        throw new Error("Service Worker فعال نیست");
+      }
+
+      // PING: اگر SW هنوز init نشده، آن را راه‌اندازی می‌کند
+      const ping = new Promise((resolvePing) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => resolvePing();
+        sw.postMessage({ type: "PING" }, [channel.port2]);
+        setTimeout(resolvePing, 2000);
+      });
+
+      // منتظر broadcast WASM_READY / GHOST_READY بمانیم
+      const ready = new Promise((resolveReady) => {
+        const handler = (event) => {
+          const { type } = event.data || {};
+          if (type === "WASM_READY" || type === "GHOST_READY") {
+            navigator.serviceWorker.removeEventListener("message", handler);
+            resolveReady();
+          }
+        };
+        navigator.serviceWorker.addEventListener("message", handler);
+        setTimeout(resolveReady, 5000);
+      });
+
+      await Promise.race([ping, ready]).catch(() => {});
+      if (!wasmReady) {
+        // آخرین فرصت: اگر broadcast از دست رفت، وضعیت را مستقیماً بخوان.
+        // این درخواست timeout دارد و نمیتواند connect را برای همیشه قفل کند.
+        const status = await requestServiceWorkerStatus(sw, 1500);
+        if (status?.wasmLoaded || status?.wasmReady) {
+          markWasmReady();
+        }
+      }
+      if (!wasmReady) {
+        throw new Error("Wasm module در Service Worker آماده نشده است.");
+      }
+    }
+
+    await sendInitSession(keys);
+
+    log("PhantomSession با موفقیت ساخته شد.", "ok");
+    setDot("session", "ok", "فعال");
+    setDot("wasm", "ok", "Router آماده");
+
+    // تمام ترافیک به Streaming Worker می‌رود (GAS حذف شده است)
+    setDot("backend", "ok", "streaming");
+    $("metric-endpoints").textContent = "stream";
+
+    setBanner("🛡️", "متصل و ایمن", "connected");
+    $("btn-destroy").disabled = false;
+    $("btn-connect").textContent = "🔄 تجدید Session";
+    updateConnectButton();
+
+    log("سیستم Ghost آماده است. ترافیک intercept می‌شود.", "ok");
+
+    // بروزرسانی آمار
+    startStatsRefresh();
+
+  } catch (err) {
+    log(`خطا در اتصال: ${err.message}`, "error");
+    setDot("session", "error", "خطا در ساخت");
+    setBanner("❌", "خطا در اتصال", "error");
+    updateConnectButton();
+  }
+};
+
+// ──────────────────────────────────────────────────────────────
+//  Public: بروزرسانی وضعیت
+// ──────────────────────────────────────────────────────────────
+window.refreshStatus = async function () {
+  const sw = swRegistration?.active || navigator.serviceWorker.controller;
+  if (!sw) {
+    log("Service Worker فعال نیست.", "warn");
+    updateConnectButton();
+    return;
+  }
+
+  const status = await requestServiceWorkerStatus(sw, 1500);
+  if (!status) {
+    log("پاسخی از Service Worker دریافت نشد.", "error");
+    updateConnectButton();
+    return;
+  }
+
+  log(
+    `وضعیت: Router=${status.routerReady}, Session=${status.hasSession}, Wasm=${status.wasmLoaded}`,
+    "info"
+  );
+
+  if (status.wasmLoaded || status.wasmReady) {
+    markWasmReady("Wasm آماده");
+  }
+  updateConnectButton();
+
+  if (status.sessionStats) {
+    const stats = JSON.parse(status.sessionStats);
+    $("metric-requests").textContent = stats.requests_made ?? "—";
+  }
+};
+
+// ──────────────────────────────────────────────────────────────
+//  Public: از بین بردن Session
+// ──────────────────────────────────────────────────────────────
+window.destroySession = function () {
+  const sw = swRegistration?.active;
+  if (sw) {
+    sw.postMessage({ type: "DESTROY" });
+    log("DESTROY ارسال شد — Session keys zeroized.", "warn");
+  }
+
+  setDot("session", "error", "destroyed");
+  setBanner("🗑️", "Session از بین رفت", "error");
+  $("btn-destroy").disabled = true;
+  $("btn-connect").textContent = "🔗 اتصال مجدد";
+  updateConnectButton();
+
+  $("metric-requests").textContent = "—";
+  stopStatsRefresh();
+};
+
+// ──────────────────────────────────────────────────────────────
+//  Stats Auto-Refresh
+// ──────────────────────────────────────────────────────────────
+let statsInterval = null;
+
+function startStatsRefresh() {
+  stopStatsRefresh();
+  statsInterval = setInterval(window.refreshStatus, 5000);
+}
+
+function stopStatsRefresh() {
+  if (statsInterval) {
+    clearInterval(statsInterval);
+    statsInterval = null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  پیام‌های دریافتی از Service Worker
+// ──────────────────────────────────────────────────────────────
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const { type, version, error, stage } = event.data || {};
+
+    if (type === "WASM_READY") {
+      markWasmReady("Wasm آماده");
+      return;
+    }
+
+    if (type === "GHOST_READY") {
+      // GHOST_READY یعنی Wasm نیز حتماً لود شده است؛ اگر WASM_READY گم شده
+      // بود، این پیام دکمه Connect را آزاد میکند.
+      markWasmReady("Router load شد");
+      log(`Service Worker آماده — v${version}`, "ok");
+      return;
+    }
+
+    if (type === "WASM_FAILED") {
+      console.error("[Ghost] Service Worker reported WASM_FAILED:", error || "unknown error");
+      reportWasmFailure(error || "unknown error");
+      return;
+    }
+
+    if (type === "GHOST_ERROR") {
+      const stageLabel = stage === "config" ? "دریافت Config" : "Router";
+      log(`خطای ${stageLabel} در Service Worker: ${error || "unknown error"}`, "error");
+    }
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+//  beforeunload — Destroy Session هنگام بستن tab
+// ──────────────────────────────────────────────────────────────
+window.addEventListener("beforeunload", () => {
+  const sw = swRegistration?.active ||
+    ("serviceWorker" in navigator ? navigator.serviceWorker.controller : null);
+  if (sw) {
+    // sendBeacon برای اطمینان از ارسال حتی در حین unload
+    // اما چون ارتباط با SW است، از postMessage استفاده می‌کنیم
+    sw.postMessage({ type: "DESTROY" });
+  }
+  stopStatsRefresh();
+});
+
+// ──────────────────────────────────────────────────────────────
+//  Tunnel Test — آیا fetch این صفحه واقعاً از SW عبور می‌کند؟
+//
+//  چرا «HTTP 200» به‌تنهایی جواب نیست:
+//    • فقط وقتی درخواست از SW عبور می‌کند که صفحه controlled باشد.
+//    • SW فقط وقتی به streaming-worker route می‌دهد که routerReady و
+//      session هر دو آماده باشند؛ وگرنه fetch(request) = pass-through.
+//    • پس وضعیت خودِ SW منبع حقیقت است، نه status code پاسخ.
+// ──────────────────────────────────────────────────────────────
+// مقصد پیش‌فرض باید در allowlist ورکر باشد، وگرنه تست هرگز سبز نمی‌شود.
+// api.ipify.org عمداً در allowlist نیست (جلوگیری از تبدیل worker به open proxy).
+const TUNNEL_TEST_DEFAULT = "https://www.youtube.com/robots.txt";
+
+function setTunnelTestOutput(text) {
+  const out = $("tunnel-test-output");
+  if (out) out.textContent = text;
+}
+
+function setTunnelTestMeta(text) {
+  const meta = $("tunnel-test-meta");
+  if (meta) meta.textContent = text;
+}
+
+// پیام دقیق fail — هم در Event Log، هم زیر دکمه
+function reportTunnelFailure(reason) {
+  log(`❌ Tunnel failed: ${reason}`, "error");
+  setTunnelTestMeta(`❌ Tunnel failed: ${reason}`);
+  return false;
+}
+
+window.runTunnelTest = async function () {
+  const input = $("tunnel-test-url");
+  const btn = $("btn-tunnel-test");
+  const url = ((input && input.value) || "").trim() || TUNNEL_TEST_DEFAULT;
+
+  if (btn) btn.disabled = true;
+  setTunnelTestOutput("—");
+  setTunnelTestMeta("در حال ارسال درخواست...");
+  log(`تست تونل: GET ${url}`, "muted");
+
+  try {
+    if (!("serviceWorker" in navigator)) {
+      return reportTunnelFailure("مرورگر از Service Worker پشتیبانی نمی‌کند.");
+    }
+
+    // بدون controller، fetch مستقیماً به شبکه می‌رود و SW آن را نمی‌بیند.
+    if (!navigator.serviceWorker.controller) {
+      return reportTunnelFailure(
+        "این صفحه توسط Service Worker کنترل نمی‌شود، پس درخواست مستقیم به شبکه می‌رود. صفحه را reload کنید."
+      );
+    }
+
+    // وضعیت واقعی SW تعیین می‌کند route می‌شود یا pass-through
+    const sw = swRegistration?.active || navigator.serviceWorker.controller;
+    const status = await requestServiceWorkerStatus(sw, 2000);
+
+    if (!status) {
+      return reportTunnelFailure("پاسخی از Service Worker دریافت نشد (GET_STATUS timeout).");
+    }
+
+    if (!status.routerReady) {
+      return reportTunnelFailure(
+        `Router آماده نیست (wasm=${status.wasmLoaded}, router=${status.routerReady}) — درخواست pass-through می‌شود.`
+      );
+    }
+
+    if (!status.hasSession) {
+      return reportTunnelFailure(
+        "Session فعال نیست — اول دکمهٔ «اتصال و Init Session» را بزنید؛ بدون آن SW نمی‌تواند URL را امضا کند."
+      );
+    }
+
+    let resp;
+    try {
+      resp = await fetch(url, { cache: "no-store" });
+    } catch (netErr) {
+      return reportTunnelFailure(`خطای شبکه/CORS: ${netErr.message}`);
+    }
+
+    const body = await resp.text();
+    setTunnelTestOutput(body || "(پاسخ خالی)");
+
+    // قرارداد sw.js: streaming | streaming-error | network-error |
+    // passthrough-error | routing-error | sign-error | denied
+    const ghostPath = (resp.headers.get("X-Ghost-Path") || "").toLowerCase();
+    const viaStreaming = ghostPath === "streaming";
+    const swWorkerError = ghostPath === "streaming-error";
+    const swLocalError =
+      ghostPath === "network-error" ||
+      ghostPath === "passthrough-error" ||
+      ghostPath === "routing-error" ||
+      ghostPath === "sign-error";
+
+    // اگر پاسخ JSON با فیلد ip بود، IP خروجی را نشان بده
+    let egressIp = null;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed.ip === "string") egressIp = parsed.ip;
+    } catch (_) {
+      egressIp = null;
+    }
+
+    const detail =
+      `HTTP ${resp.status}` +
+      ` · router=${status.routerReady}, session=${status.hasSession}` +
+      ` · path=${ghostPath || "none (pass-through)"}` +
+      (egressIp ? ` · IP خروجی: ${egressIp}` : "");
+
+    // ✅ فقط وقتی که واقعاً از مسیر streaming-worker برگشته باشد
+    if (resp.ok && viaStreaming) {
+      log("✅ Tunnel is working!", "ok");
+      log(`جزئیات: ${detail}`, "muted");
+      setTunnelTestMeta(`✅ Tunnel is working! — ${detail}`);
+      return true;
+    }
+
+    // SW پیام واقعی worker را برگردانده است (403/429/502/…)
+    if (swWorkerError) {
+      reportTunnelFailure(
+        `درخواست intercept شد و به streaming-worker رفت، اما worker آن را رد کرد — ` +
+          `${body.trim().slice(0, 300)}`
+      );
+      log(`جزئیات: ${detail}`, "muted");
+      log("مقصد باید در allowlist باشد؛ مثلاً https://www.youtube.com/robots.txt را امتحان کنید.", "muted");
+      return false;
+    }
+
+    // خطای محلی SW (شبکه/CORS، pass-through، routing، امضا)
+    if (swLocalError) {
+      reportTunnelFailure(`Service Worker: ${body.trim().slice(0, 300)}`);
+      log(`جزئیات: ${detail}`, "muted");
+      return false;
+    }
+
+    if (resp.ok && !viaStreaming) {
+      return reportTunnelFailure(
+        `پاسخ ${resp.status} رسید اما نشانهٔ مسیر streaming دیده نشد ` +
+          `(هدر X-Ghost-Path غایب است). ${detail}`
+      );
+    }
+
+    reportTunnelFailure(
+      `پاسخ ناموفق ${resp.status}${resp.statusText ? " " + resp.statusText : ""}.`
+    );
+    log(`جزئیات: ${detail}`, "muted");
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+};
+
+// ──────────────────────────────────────────────────────────────
+//  Init on load
+// ──────────────────────────────────────────────────────────────
+// شروع شمارش ۵ ثانیه از زمان اجرای UI — مستقل از register/activate/status.
+armWasmLoadFailSafe();
+
+document.addEventListener("DOMContentLoaded", async () => {
+  log(`SCP-GHOST UI v${SW_VERSION} بارگذاری شد.`, "info");
+  await registerServiceWorker();
+  if (wasmReady) {
+    log("برای شروع، دکمه «اتصال و Init Session» را بفشارید.", "muted");
+  }
+});
+</script>
+</body>
+</html>
